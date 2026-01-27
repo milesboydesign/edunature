@@ -1335,7 +1335,7 @@
         const sendPrivateBtn = document.getElementById('send-private-message');
         const closePrivateChat = document.getElementById('close-private-chat');
 
-        // Call Elements - NEW INTEGRATION
+        // Call Elements
         const callPopup = document.getElementById('callPopup');
         const callText = document.getElementById('callText');
         const callerName = document.getElementById('callerName');
@@ -1365,8 +1365,10 @@
         let currentPrivateChatWith = null;
         let privateChatHistory = {};
         let canSendMessage = true;
+        let messageCooldown = false;
+        let privateMessageCooldown = false;
 
-        // WebRTC Call State - NEW INTEGRATION
+        // WebRTC Call State
         let currentCall = null;
         let isInCall = false;
         let localStream = null;
@@ -1377,6 +1379,10 @@
         let isSharing = false;
         let screenStream = null;
         let callTimeout = null;
+        let callCooldown = false;
+        let pendingCallOffer = null;
+        let pendingCaller = null;
+        let lastCallEndTime = 0;
 
         // Generate unique device ID
         function generateDeviceId() {
@@ -1617,7 +1623,7 @@
             loadMessages();
             loadPrivateMessages();
             setupEventListeners();
-            setupCallChannel(); // Setup call channel after login
+            setupCallChannel();
             
             onlineCheckInterval = setInterval(() => {
                 updateOnlineStatus();
@@ -1638,7 +1644,7 @@
             showAlert("Welcome!", `${randomGreeting} You're now chatting as ${username}`, "success");
         }
 
-        // ==================== CALL LOGIC - NEW INTEGRATION ====================
+        // ==================== FIXED CALL LOGIC ====================
         
         /* ------------------ MEDIA ------------------ */
         async function getMedia() {
@@ -1704,8 +1710,188 @@
             };
         }
 
-        /* ------------------ START CALL ------------------ */
+        /* ------------------ DECLINE CALL ------------------ */
+        function declineCall() {
+            if (pendingCaller && callChannel) {
+                callChannel.send({
+                    type: "broadcast",
+                    event: "call-declined",
+                    payload: { from: username, to: pendingCaller }
+                });
+            }
+            callPopup.style.display = 'none';
+            pendingCaller = null;
+            pendingCallOffer = null;
+            if (callTimeout) clearTimeout(callTimeout);
+        }
+
+        /* ------------------ SETUP CALL CHANNEL (FIXED) ------------------ */
+        function setupCallChannel() {
+            callChannel = supabase.channel("webrtc-calls");
+            
+            callChannel.subscribe();
+            
+            callChannel.on("broadcast", { event: "offer" }, async ({ payload }) => {
+                if (payload.to !== username) return;
+                
+                console.log('📞 Call offer from:', payload.from);
+                pendingCaller = payload.from;
+                pendingCallOffer = payload.offer;
+                
+                // Show call popup
+                callerName.textContent = payload.from;
+                callPopup.style.display = 'flex';
+                showAlert("Incoming Call", `${payload.from} is calling you`, "info");
+                
+                // Auto decline after 30 seconds
+                if (callTimeout) clearTimeout(callTimeout);
+                callTimeout = setTimeout(() => {
+                    if (callPopup.style.display === 'flex') {
+                        declineCall();
+                    }
+                }, 30000);
+            });
+
+            callChannel.on("broadcast", { event: "answer" }, async ({ payload }) => {
+                if (payload.to !== username || currentCall !== payload.from) return;
+                
+                console.log('✅ Call answered by:', payload.from);
+                try {
+                    if (peerConnection && peerConnection.signalingState === "have-local-offer") {
+                        await peerConnection.setRemoteDescription(payload.answer);
+                        remoteLabel.textContent = payload.from;
+                        showAlert("Call Connected", `${payload.from} accepted your call!`, "success");
+                        
+                        // Clear timeout since call was answered
+                        if (callTimeout) clearTimeout(callTimeout);
+                    }
+                } catch (error) {
+                    console.error("Error setting remote description:", error);
+                }
+            });
+
+            callChannel.on("broadcast", { event: "ice" }, async ({ payload }) => {
+                if (payload.to !== username || currentCall !== payload.from) return;
+                
+                try {
+                    if (peerConnection && peerConnection.remoteDescription) {
+                        await peerConnection.addIceCandidate(payload.candidate);
+                    }
+                } catch (error) {
+                    console.error("Error adding ICE candidate:", error);
+                }
+            });
+
+            callChannel.on("broadcast", { event: "call-declined" }, ({ payload }) => {
+                if (payload.to === username && currentCall === payload.from) {
+                    console.log('❌ Call declined by remote');
+                    showAlert("Call Declined", `${payload.from} declined the call`, "error");
+                    endVideoCall();
+                    currentCall = null;
+                    callPopup.style.display = 'none';
+                }
+            });
+
+            callChannel.on("broadcast", { event: "call-ended" }, ({ payload }) => {
+                if ((payload.from === currentCall) || (payload.to === username && payload.from === currentCall)) {
+                    console.log('📞 Call ended by remote');
+                    showAlert("Call Ended", `${currentCall} ended the call`, "info");
+                    endVideoCall();
+                    currentCall = null;
+                }
+            });
+
+            callChannel.on("broadcast", { event: "call-canceled" }, ({ payload }) => {
+                if (payload.to === username && pendingCaller === payload.from) {
+                    console.log('📞 Call canceled by caller');
+                    showAlert("Call Canceled", `${payload.from} canceled the call`, "info");
+                    callPopup.style.display = 'none';
+                    pendingCaller = null;
+                    pendingCallOffer = null;
+                    if (callTimeout) clearTimeout(callTimeout);
+                }
+            });
+            
+            // Online status broadcasting
+            callChannel.on("broadcast", { event: "online-status" }, (payload) => {
+                const { username: user, status, lastSeen, timestamp } = payload.payload;
+                
+                if (user !== username) {
+                    const now = Date.now();
+                    chatUsers.set(user, { 
+                        lastSeen, 
+                        online: status === 'online',
+                        lastUpdated: timestamp || now
+                    });
+                    updateUserList();
+                }
+            });
+            
+            // Private messages with duplicate prevention
+            callChannel.on("broadcast", { event: "private-message" }, (payload) => {
+                const { from, to, message, timestamp, messageId } = payload.payload;
+                
+                if (to !== username) return;
+                
+                // Check for duplicate message
+                const chatKey = [from, to].sort().join('_');
+                if (privateChatHistory[chatKey]) {
+                    const isDuplicate = privateChatHistory[chatKey].some(msg => 
+                        msg.message === message && 
+                        msg.from === from && 
+                        Math.abs(new Date(msg.timestamp) - new Date(timestamp)) < 1000
+                    );
+                    if (isDuplicate) return;
+                }
+                
+                // Add to private chat if open
+                if (from === currentPrivateChatWith) {
+                    addPrivateMessageToChat(from, message, timestamp, false);
+                }
+                
+                // Store in history
+                if (!privateChatHistory[chatKey]) {
+                    privateChatHistory[chatKey] = [];
+                }
+                privateChatHistory[chatKey].push({
+                    from,
+                    message,
+                    timestamp,
+                    isSent: false,
+                    messageId: messageId || Date.now()
+                });
+                
+                // Save to localStorage
+                savePrivateMessages();
+                
+                // Show notification if chat is not open
+                if (from !== username && currentPrivateChatWith !== from) {
+                    showAlert("Private Message", `${from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`, "info");
+                }
+            });
+            
+            // Typing indicator
+            callChannel.on("broadcast", { event: "user-typing" }, (payload) => {
+                const { username: user, isTyping } = payload.payload;
+                
+                if (user !== username) {
+                    if (isTyping) {
+                        typingIndicator.textContent = `${user} is typing...`;
+                    } else {
+                        typingIndicator.textContent = '';
+                    }
+                }
+            });
+        }
+
+        /* ------------------ START CALL (FIXED) ------------------ */
         window.initiateCall = async function (targetUser) {
+            const now = Date.now();
+            if (callCooldown) {
+                showAlert("Slow Down", "Please wait a moment before starting another call", "warning");
+                return;
+            }
+            
             if (!callChannel) {
                 showAlert("Error", "Call system not initialized", "error");
                 return;
@@ -1743,7 +1929,10 @@
                 createPeer(targetUser);
                 
                 // Create offer
-                const offer = await peerConnection.createOffer();
+                const offer = await peerConnection.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: true
+                });
                 await peerConnection.setLocalDescription(offer);
                 
                 // Send call request
@@ -1759,6 +1948,12 @@
                 remoteLabel.textContent = `Calling ${targetUser}...`;
                 
                 showAlert("Calling...", `Initiating video call with ${targetUser}`, "info");
+                
+                // Set cooldown
+                callCooldown = true;
+                setTimeout(() => {
+                    callCooldown = false;
+                }, 3000);
                 
                 // Auto cancel after 45 seconds if no answer
                 if (callTimeout) clearTimeout(callTimeout);
@@ -1781,137 +1976,62 @@
                     peerConnection.close();
                     peerConnection = null;
                 }
+                callCooldown = false;
             }
         };
 
-        /* ------------------ SETUP CALL CHANNEL ------------------ */
-        function setupCallChannel() {
-            callChannel = supabase.channel("webrtc-calls");
+        /* ------------------ ACCEPT CALL ------------------ */
+        async function acceptCall() {
+            console.log('✅ Accepting call from:', pendingCaller);
+            callPopup.style.display = 'none';
+            if (callTimeout) clearTimeout(callTimeout);
             
-            // Subscribe to channel
-            callChannel.subscribe();
-            
-            /* ------------------ SIGNALING ------------------ */
-            callChannel.on("broadcast", { event: "offer" }, async ({ payload }) => {
-                if (payload.to !== username) return;
-                
-                console.log('📞 Call offer from:', payload.from);
-                callerName.textContent = payload.from;
-                currentCall = payload.from;
-                
-                // Store the offer for when user accepts
-                window.pendingCallOffer = payload.offer;
-                
-                callPopup.style.display = 'flex';
-                showAlert("Incoming Call", `${payload.from} is calling you`, "info");
-                
-                // Auto decline after 30 seconds
-                if (callTimeout) clearTimeout(callTimeout);
-                callTimeout = setTimeout(() => {
-                    if (callPopup.style.display === 'flex') {
-                        callPopup.style.display = 'none';
-                        showAlert("Call Missed", `${payload.from}'s call was missed`, "warning");
-                        if (callChannel) {
-                            callChannel.send({
-                                type: "broadcast",
-                                event: "call-declined",
-                                payload: { from: username, to: payload.from }
-                            });
-                        }
-                        currentCall = null;
-                        window.pendingCallOffer = null;
+            if (pendingCaller && callChannel) {
+                try {
+                    // Get local media
+                    const mediaSuccess = await getMedia();
+                    if (!mediaSuccess) {
+                        pendingCaller = null;
+                        pendingCallOffer = null;
+                        return;
                     }
-                }, 30000);
-            });
-
-            callChannel.on("broadcast", { event: "answer" }, async ({ payload }) => {
-                if (payload.to !== username) return;
-                
-                console.log('✅ Call answered by:', payload.from);
-                if (peerConnection && peerConnection.signalingState !== "closed") {
-                    await peerConnection.setRemoteDescription(payload.answer);
-                    remoteLabel.textContent = payload.from;
-                    showAlert("Call Connected", `${payload.from} accepted your call!`, "success");
-                }
-            });
-
-            callChannel.on("broadcast", { event: "ice" }, async ({ payload }) => {
-                if (payload.to !== username) return;
-                
-                if (peerConnection && peerConnection.remoteDescription) {
-                    await peerConnection.addIceCandidate(payload.candidate);
-                }
-            });
-
-            callChannel.on("broadcast", { event: "call-declined" }, ({ payload }) => {
-                if ((payload.from === username && payload.to === currentCall) || 
-                    (payload.to === username && payload.from === currentCall)) {
-                    console.log('❌ Call declined');
-                    showAlert("Call Declined", `${currentCall} declined the call`, "error");
+                    
+                    // Create peer connection
+                    createPeer(pendingCaller);
+                    currentCall = pendingCaller;
+                    
+                    // Set remote description from stored offer
+                    if (pendingCallOffer) {
+                        await peerConnection.setRemoteDescription(pendingCallOffer);
+                        
+                        // Create and send answer
+                        const answer = await peerConnection.createAnswer();
+                        await peerConnection.setLocalDescription(answer);
+                        
+                        callChannel.send({
+                            type: "broadcast",
+                            event: "answer",
+                            payload: { to: currentCall, from: username, answer }
+                        });
+                        
+                        // Show call UI
+                        videoContainer.style.display = 'flex';
+                        isInCall = true;
+                        remoteLabel.textContent = currentCall;
+                        
+                        showAlert("Call Accepted", `You accepted the call from ${currentCall}`, "success");
+                    }
+                    
+                } catch (error) {
+                    console.error("❌ Error accepting call:", error);
+                    showAlert("Call Failed", error.message || "Could not accept call", "error");
                     currentCall = null;
-                    callPopup.style.display = 'none';
                     endVideoCall();
                 }
-            });
+            }
             
-            // Online status broadcasting
-            callChannel.on("broadcast", { event: "online-status" }, (payload) => {
-                const { username: user, status, lastSeen, timestamp } = payload.payload;
-                
-                if (user !== username) {
-                    const now = Date.now();
-                    chatUsers.set(user, { 
-                        lastSeen, 
-                        online: status === 'online',
-                        lastUpdated: timestamp || now
-                    });
-                    updateUserList();
-                }
-            });
-            
-            // Private messages
-            callChannel.on("broadcast", { event: "private-message" }, (payload) => {
-                const { from, to, message, timestamp } = payload.payload;
-                
-                if ((from === currentPrivateChatWith && to === username) || 
-                    (to === currentPrivateChatWith && from === username)) {
-                    // Add to private chat if open
-                    addPrivateMessageToChat(from, message, timestamp, from === username);
-                    
-                    // Store in history
-                    const chatKey = [from, to].sort().join('_');
-                    if (!privateChatHistory[chatKey]) {
-                        privateChatHistory[chatKey] = [];
-                    }
-                    privateChatHistory[chatKey].push({
-                        from,
-                        message,
-                        timestamp,
-                        isSent: from === username
-                    });
-                    
-                    // Save to localStorage
-                    savePrivateMessages();
-                    
-                    // Show notification if chat is not open
-                    if (from !== username && currentPrivateChatWith !== from) {
-                        showAlert("Private Message", `${from}: ${message.substring(0, 50)}...`, "info");
-                    }
-                }
-            });
-            
-            // Typing indicator
-            callChannel.on("broadcast", { event: "user-typing" }, (payload) => {
-                const { username: user, isTyping } = payload.payload;
-                
-                if (user !== username) {
-                    if (isTyping) {
-                        typingIndicator.textContent = `${user} is typing...`;
-                    } else {
-                        typingIndicator.textContent = '';
-                    }
-                }
-            });
+            pendingCaller = null;
+            pendingCallOffer = null;
         }
 
         /* ------------------ CALL CONTROLS ------------------ */
@@ -2023,7 +2143,7 @@
                 callChannel.send({
                     type: "broadcast",
                     event: "call-ended",
-                    payload: { from: username }
+                    payload: { from: username, to: currentCall }
                 });
             }
             
@@ -2042,12 +2162,120 @@
             callFullscreenBtn.innerHTML = '<i class="fas fa-expand"></i> Fullscreen';
             callFullscreenBtn.style.background = '#3498db';
             
+            // Set cooldown
+            callCooldown = true;
+            setTimeout(() => {
+                callCooldown = false;
+            }, 3000);
+            
             showAlert("Call Ended", "Call has been terminated", "info");
         }
 
-        // ==================== END CALL LOGIC ====================
+        // ==================== MESSAGE COOLDOWN SYSTEM ====================
+        
+        /* ------------------ SEND MESSAGE WITH COOLDOWN ------------------ */
+        async function sendMessage() {
+            if (messageCooldown) {
+                showAlert("Slow Down", "Please wait a moment before sending another message", "warning");
+                return;
+            }
+            
+            const text = messageInput.value.trim();
+            if (!text) {
+                showAlert("Empty message", "Type something to send!", "warning");
+                return;
+            }
+            
+            // Set cooldown
+            messageCooldown = true;
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<i class="fas fa-clock"></i> Wait...';
+            
+            const msg = { username, message: text };
+            renderMessage(msg);
+            localEchoQueue.push({ username, text });
+            messageInput.value = '';
+            
+            try {
+                await supabase.from('themessages').insert([msg]);
+            } catch (error) {
+                console.error("Error sending message:", error);
+                showAlert("Error", "Failed to send message", "error");
+            }
+            
+            // Clear cooldown after 1 second
+            setTimeout(() => {
+                messageCooldown = false;
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send';
+            }, 1000);
+        }
 
-        // Keyboard shortcuts
+        /* ------------------ SEND PRIVATE MESSAGE WITH COOLDOWN ------------------ */
+        async function sendPrivateMessage() {
+            if (privateMessageCooldown) {
+                showAlert("Slow Down", "Please wait a moment before sending another message", "warning");
+                return;
+            }
+            
+            const text = privateMessageInput.value.trim();
+            if (!text || !currentPrivateChatWith) {
+                return;
+            }
+            
+            // Set cooldown
+            privateMessageCooldown = true;
+            sendPrivateBtn.disabled = true;
+            sendPrivateBtn.innerHTML = '<i class="fas fa-clock"></i> Wait...';
+            
+            const timestamp = new Date().toISOString();
+            const messageId = Date.now();
+            
+            // Add to UI immediately
+            addPrivateMessageToChat(username, text, timestamp, true);
+            
+            // Store in history
+            const chatKey = [username, currentPrivateChatWith].sort().join('_');
+            if (!privateChatHistory[chatKey]) {
+                privateChatHistory[chatKey] = [];
+            }
+            privateChatHistory[chatKey].push({
+                from: username,
+                message: text,
+                timestamp,
+                isSent: true,
+                messageId
+            });
+            
+            // Save to localStorage
+            savePrivateMessages();
+            
+            // Send via signaling channel
+            if (callChannel) {
+                callChannel.send({
+                    type: 'broadcast',
+                    event: 'private-message',
+                    payload: {
+                        from: username,
+                        to: currentPrivateChatWith,
+                        message: text,
+                        timestamp,
+                        messageId
+                    }
+                });
+            }
+            
+            privateMessageInput.value = '';
+            
+            // Clear cooldown after 1 second
+            setTimeout(() => {
+                privateMessageCooldown = false;
+                sendPrivateBtn.disabled = false;
+                sendPrivateBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send';
+            }, 1000);
+        }
+
+        // ==================== KEYBOARD SHORTCUTS ====================
         function setupKeyboardShortcuts() {
             document.addEventListener('keydown', (e) => {
                 // Press ] to open password modal from nature site
@@ -2095,6 +2323,8 @@
             });
         }
 
+        // ==================== EVENT LISTENERS ====================
+        
         // Login functionality
         loginBtn.addEventListener('click', async function() {
             const name = usernameInput.value.trim();
@@ -2161,7 +2391,7 @@
 
         // Setup event listeners
         function setupEventListeners() {
-            // Message sending
+            // Message sending with cooldown
             sendBtn.addEventListener('click', sendMessage);
             messageInput.addEventListener('keypress', e => {
                 if (e.key === 'Enter') sendMessage();
@@ -2200,78 +2430,11 @@
                 showAlert("Refreshed!", "Messages updated successfully", "success");
             });
 
-            // Call popup buttons - UPDATED WITH NEW LOGIC
-            callYes.addEventListener('click', async function() {
-                console.log('✅ Accepting call from:', currentCall);
-                callPopup.style.display = 'none';
-                if (callTimeout) clearTimeout(callTimeout);
-                
-                if (currentCall && callChannel) {
-                    try {
-                        // Get local media
-                        const mediaSuccess = await getMedia();
-                        if (!mediaSuccess) {
-                            currentCall = null;
-                            window.pendingCallOffer = null;
-                            return;
-                        }
-                        
-                        // Create peer connection
-                        createPeer(currentCall);
-                        
-                        // Set remote description from stored offer
-                        if (window.pendingCallOffer) {
-                            await peerConnection.setRemoteDescription(window.pendingCallOffer);
-                            
-                            // Create and send answer
-                            const answer = await peerConnection.createAnswer();
-                            await peerConnection.setLocalDescription(answer);
-                            
-                            callChannel.send({
-                                type: "broadcast",
-                                event: "answer",
-                                payload: { to: currentCall, from: username, answer }
-                            });
-                            
-                            // Show call UI
-                            videoContainer.style.display = 'flex';
-                            isInCall = true;
-                            remoteLabel.textContent = currentCall;
-                            
-                            showAlert("Call Accepted", `You accepted the call from ${currentCall}`, "success");
-                            
-                            window.pendingCallOffer = null;
-                        }
-                        
-                    } catch (error) {
-                        console.error("❌ Error accepting call:", error);
-                        showAlert("Call Failed", error.message || "Could not accept call", "error");
-                        currentCall = null;
-                        window.pendingCallOffer = null;
-                        endVideoCall();
-                    }
-                }
-            });
+            // Call popup buttons
+            callYes.addEventListener('click', acceptCall);
+            callNo.addEventListener('click', declineCall);
 
-            callNo.addEventListener('click', function() {
-                console.log('❌ Declining call');
-                callPopup.style.display = 'none';
-                if (callTimeout) clearTimeout(callTimeout);
-                
-                if (currentCall && callChannel) {
-                    callChannel.send({
-                        type: "broadcast",
-                        event: "call-declined",
-                        payload: { from: username, to: currentCall }
-                    });
-                }
-                
-                showAlert("Call Declined", "You declined the video call", "info");
-                currentCall = null;
-                window.pendingCallOffer = null;
-            });
-
-            // Video call controls - CONNECTED TO NEW FUNCTIONS
+            // Video call controls
             callMuteBtn.addEventListener('click', toggleMute);
             callFullscreenBtn.addEventListener('click', toggleFullscreen);
             callShareBtn.addEventListener('click', toggleShareScreen);
@@ -2345,7 +2508,7 @@
             }
         }
 
-        // Show user info modal with private chat option
+        // ==================== USER INFO MODAL ====================
         function showUserInfo(user) {
             const modal = document.createElement('div');
             modal.className = 'profile-modal';
@@ -2428,6 +2591,8 @@
             });
         }
 
+        // ==================== PRIVATE CHAT FUNCTIONS ====================
+        
         // Open private chat with user
         function openPrivateChat(user) {
             currentPrivateChatWith = user;
@@ -2495,53 +2660,6 @@
             }, 100);
         }
 
-        // Send private message
-        async function sendPrivateMessage() {
-            const text = privateMessageInput.value.trim();
-            if (!text || !currentPrivateChatWith) {
-                return;
-            }
-            
-            const timestamp = new Date().toISOString();
-            
-            // Add to UI immediately
-            addPrivateMessageToChat(username, text, timestamp, true);
-            
-            // Store in history
-            const chatKey = [username, currentPrivateChatWith].sort().join('_');
-            if (!privateChatHistory[chatKey]) {
-                privateChatHistory[chatKey] = [];
-            }
-            privateChatHistory[chatKey].push({
-                from: username,
-                message: text,
-                timestamp,
-                isSent: true
-            });
-            
-            // Save to localStorage
-            savePrivateMessages();
-            
-            // Send via signaling channel
-            if (callChannel) {
-                callChannel.send({
-                    type: 'broadcast',
-                    event: 'private-message',
-                    payload: {
-                        from: username,
-                        to: currentPrivateChatWith,
-                        message: text,
-                        timestamp
-                    }
-                });
-            }
-            
-            privateMessageInput.value = '';
-            
-            // Clear typing indicator
-            privateLocalEchoQueue.push({ username, text });
-        }
-
         // Load private messages from localStorage
         function loadPrivateMessages() {
             const saved = localStorage.getItem('privateChatHistory');
@@ -2564,7 +2682,8 @@
             }
         }
 
-        // Message rendering
+        // ==================== MESSAGE RENDERING ====================
+        
         function renderMessage(msg) {
             const messageDiv = document.createElement('div');
             const isSent = username === msg.username;
@@ -2635,7 +2754,6 @@
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
 
-        // Message functions
         async function loadMessages() {
             const { data } = await supabase.from('themessages').select('*').order('id', { ascending: true });
             chatMessages.innerHTML = '';
@@ -2648,20 +2766,6 @@
             }
             
             chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-
-        async function sendMessage() {
-            const text = messageInput.value.trim();
-            if (!text) {
-                showAlert("Empty message", "Type something to send!", "warning");
-                return;
-            }
-            
-            const msg = { username, message: text };
-            renderMessage(msg);
-            localEchoQueue.push({ username, text });
-            messageInput.value = '';
-            await supabase.from('themessages').insert([msg]);
         }
 
         function filterMessages() {
@@ -2697,7 +2801,8 @@
             }
         }
 
-        // User list functions
+        // ==================== USER LIST FUNCTIONS ====================
+        
         function updateUserList() {
             usersContainer.innerHTML = '';
             
@@ -2770,7 +2875,8 @@
             container.appendChild(userItem);
         }
 
-        // Supabase subscriptions for messages
+        // ==================== SUPABASE SUBSCRIPTIONS ====================
+        
         supabase.channel('messages')
             .on('postgres_changes', {
                 event: 'INSERT',
@@ -2787,7 +2893,8 @@
             })
             .subscribe();
 
-        // Initialize
+        // ==================== INITIALIZATION ====================
+        
         function initialize() {
             setupKeyboardShortcuts();
             checkAutoLogin();
