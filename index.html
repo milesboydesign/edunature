@@ -1230,8 +1230,8 @@
         </div>
     </div>
     
-    <!-- Call Popup -->
-    <div id="callPopup">
+    <!-- Call Popup - NO LONGER USED WITH PEERJS -->
+    <div id="callPopup" style="display: none;">
         <div id="callPopupBox">
             <div class="call-icon">
                 <i class="fas fa-video"></i>
@@ -1306,6 +1306,9 @@
         </div>
     </div>
 
+    <!-- PeerJS Library -->
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+
     <script type="module">
         import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -1344,11 +1347,6 @@
         const closePrivateChat = document.getElementById('close-private-chat');
 
         // Call Elements
-        const callPopup = document.getElementById('callPopup');
-        const callText = document.getElementById('callText');
-        const callerName = document.getElementById('callerName');
-        const callYes = document.getElementById('callYes');
-        const callNo = document.getElementById('callNo');
         const videoContainer = document.getElementById('videoCallContainer');
         const localVideo = document.getElementById('localVideo');
         const remoteVideo = document.getElementById('remoteVideo');
@@ -1373,35 +1371,331 @@
         let currentPrivateChatWith = null;
         let privateChatHistory = {};
 
-        // WebRTC Call State
+        // PEERJS Call State
+        let myPeer = null;
+        let myPeerId = null;
         let currentCall = null;
         let isInCall = false;
         let localStream = null;
-        let peerConnection = null;
-        let callChannel = null;
+        let callCooldown = false;
         let isMuted = false;
         let isFullscreen = false;
         let isSharing = false;
-        let screenStream = null;
-        let callTimeout = null;
-        let pendingCallOffer = null;
-        let pendingCaller = null;
+        let callChannel = null;
         
         // Cooldown states
         let messageCooldown = false;
         let privateMessageCooldown = false;
-        let callCooldown = false;
         let messageCooldownTimer = null;
         let privateMessageCooldownTimer = null;
 
-        // Generate unique device ID
+        // ==================== PEERJS CALL SYSTEM ====================
+        
+        function initializePeerJS() {
+            try {
+                // Generate unique peer ID based on username
+                const peerId = `${username}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+                
+                myPeer = new Peer(peerId, {
+                    host: '0.peerjs.com',
+                    port: 443,
+                    path: '/',
+                    secure: true,
+                    debug: 3,
+                    config: {
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' },
+                            { urls: 'stun:stun1.l.google.com:19302' },
+                            { urls: 'stun:stun2.l.google.com:19302' }
+                        ]
+                    }
+                });
+
+                myPeer.on('open', (id) => {
+                    myPeerId = id;
+                    console.log('✅ PeerJS connected with ID:', id);
+                    
+                    // Broadcast peer ID to all users
+                    if (callChannel) {
+                        callChannel.send({
+                            type: 'broadcast',
+                            event: 'peer-id',
+                            payload: {
+                                username: username,
+                                peerId: id,
+                                timestamp: Date.now()
+                            }
+                        });
+                    }
+                });
+
+                myPeer.on('call', (call) => {
+                    console.log('📞 Incoming call from:', call.peer);
+                    
+                    // Get media
+                    navigator.mediaDevices.getUserMedia({
+                        video: true,
+                        audio: true
+                    }).then(stream => {
+                        localStream = stream;
+                        localVideo.srcObject = stream;
+                        localLabel.textContent = `${username} (You)`;
+                        
+                        // Answer the call
+                        call.answer(stream);
+                        currentCall = call;
+                        isInCall = true;
+                        
+                        // Show call UI
+                        videoContainer.style.display = 'flex';
+                        remoteLabel.textContent = 'Caller';
+                        
+                        call.on('stream', (remoteStream) => {
+                            console.log('✅ Received remote stream');
+                            remoteVideo.srcObject = remoteStream;
+                            showAlert("Call Connected", "You are now in a call", "success", 2000);
+                        });
+                        
+                        call.on('close', () => {
+                            console.log('📞 Call closed by remote');
+                            endVideoCall();
+                        });
+                        
+                        call.on('error', (err) => {
+                            console.error('Call error:', err);
+                            endVideoCall();
+                        });
+                        
+                    }).catch(err => {
+                        console.error('Failed to get media:', err);
+                        showAlert("Media Error", "Could not access camera/microphone", "error");
+                    });
+                });
+
+                myPeer.on('error', (err) => {
+                    console.error('PeerJS error:', err);
+                    if (err.type === 'peer-unavailable') {
+                        showAlert("User Unavailable", "The user is not available for calls", "error");
+                    }
+                });
+
+                console.log('PeerJS initializing...');
+                
+            } catch (error) {
+                console.error('Failed to initialize PeerJS:', error);
+                showAlert("Connection Error", "Could not initialize call system", "error");
+            }
+        }
+
+        // Modified initiateCall function using PeerJS
+        window.initiateCall = async function(targetUser) {
+            if (callCooldown || isInCall) {
+                return;
+            }
+            
+            const userData = chatUsers.get(targetUser);
+            if (!userData || !userData.online || targetUser === username) {
+                showAlert("Cannot Call", "User is offline or unavailable", "warning");
+                return;
+            }
+            
+            if (!userData.peerId) {
+                showAlert("Cannot Call", "User's connection is not ready yet", "warning");
+                return;
+            }
+            
+            try {
+                console.log(`📞 Calling ${targetUser} (Peer ID: ${userData.peerId})`);
+                
+                // Get media first
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    },
+                    audio: true
+                });
+                
+                localStream = stream;
+                localVideo.srcObject = stream;
+                localLabel.textContent = `${username} (You)`;
+                
+                // Initiate call through PeerJS
+                const call = myPeer.call(userData.peerId, stream);
+                
+                if (!call) {
+                    throw new Error('Failed to create call');
+                }
+                
+                currentCall = call;
+                isInCall = true;
+                
+                // Show call UI immediately
+                videoContainer.style.display = 'flex';
+                remoteLabel.textContent = `Calling ${targetUser}...`;
+                
+                call.on('stream', (remoteStream) => {
+                    console.log('✅ Received remote stream from', targetUser);
+                    remoteVideo.srcObject = remoteStream;
+                    remoteLabel.textContent = targetUser;
+                    showAlert("Call Connected", `Connected to ${targetUser}`, "success", 2000);
+                });
+                
+                call.on('close', () => {
+                    console.log('📞 Call closed');
+                    endVideoCall();
+                });
+                
+                call.on('error', (err) => {
+                    console.error('Call error:', err);
+                    showAlert("Call Failed", "Could not establish connection", "error");
+                    endVideoCall();
+                });
+                
+                // Set cooldown
+                callCooldown = true;
+                setTimeout(() => {
+                    callCooldown = false;
+                }, 3000);
+                
+            } catch (error) {
+                console.error('Call failed:', error);
+                showAlert("Call Failed", error.message || "Could not start call", "error");
+                
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
+                }
+                
+                callCooldown = false;
+                isInCall = false;
+                currentCall = null;
+            }
+        };
+
+        function endVideoCall() {
+            console.log('📞 Ending call');
+            
+            if (currentCall) {
+                currentCall.close();
+                currentCall = null;
+            }
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+                localVideo.srcObject = null;
+            }
+            
+            if (remoteVideo.srcObject) {
+                remoteVideo.srcObject.getTracks().forEach(track => track.stop());
+                remoteVideo.srcObject = null;
+            }
+            
+            videoContainer.style.display = 'none';
+            isInCall = false;
+            isMuted = false;
+            isSharing = false;
+            
+            // Reset mute button
+            callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
+            callMuteBtn.style.background = '#f39c12';
+            
+            // Set cooldown
+            callCooldown = true;
+            setTimeout(() => {
+                callCooldown = false;
+            }, 3000);
+        }
+
+        function toggleMute() {
+            if (!localStream) return;
+            
+            const audioTracks = localStream.getAudioTracks();
+            if (audioTracks.length > 0) {
+                isMuted = !isMuted;
+                audioTracks[0].enabled = !isMuted;
+                
+                if (isMuted) {
+                    callMuteBtn.innerHTML = '<i class="fas fa-microphone-slash"></i> Unmute';
+                    callMuteBtn.style.background = '#e74c3c';
+                } else {
+                    callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
+                    callMuteBtn.style.background = '#f39c12';
+                }
+            }
+        }
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                videoContainer.requestFullscreen();
+                videoContainer.classList.add('fullscreen');
+                isFullscreen = true;
+                callFullscreenBtn.innerHTML = '<i class="fas fa-compress"></i> Exit Fullscreen';
+                callFullscreenBtn.style.background = '#e74c3c';
+            } else {
+                document.exitFullscreen();
+                videoContainer.classList.remove('fullscreen');
+                isFullscreen = false;
+                callFullscreenBtn.innerHTML = '<i class="fas fa-expand"></i> Fullscreen';
+                callFullscreenBtn.style.background = '#3498db';
+            }
+        }
+
+        function toggleShareScreen() {
+            if (!isSharing) {
+                navigator.mediaDevices.getDisplayMedia({ video: true })
+                    .then(stream => {
+                        isSharing = true;
+                        screenStream = stream;
+                        callShareBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Share';
+                        callShareBtn.style.background = '#e74c3c';
+                        
+                        // Replace video track in current call
+                        if (currentCall && currentCall.peerConnection) {
+                            const videoSender = currentCall.peerConnection.getSenders()
+                                .find(sender => sender.track && sender.track.kind === 'video');
+                            if (videoSender) {
+                                videoSender.replaceTrack(stream.getVideoTracks()[0]);
+                            }
+                        }
+                        
+                        stream.getVideoTracks()[0].onended = () => {
+                            toggleShareScreen();
+                        };
+                        
+                    }).catch(err => {
+                        console.error('Error sharing screen:', err);
+                    });
+            } else {
+                isSharing = false;
+                callShareBtn.innerHTML = '<i class="fas fa-share-square"></i> Share';
+                callShareBtn.style.background = '#2ecc71';
+                
+                if (screenStream) {
+                    screenStream.getTracks().forEach(track => track.stop());
+                    screenStream = null;
+                }
+                
+                // Restore camera track
+                if (currentCall && localStream) {
+                    const videoSender = currentCall.peerConnection.getSenders()
+                        .find(sender => sender.track && sender.track.kind === 'video');
+                    if (videoSender && localStream.getVideoTracks()[0]) {
+                        videoSender.replaceTrack(localStream.getVideoTracks()[0]);
+                    }
+                }
+            }
+        }
+
+        // ==================== SUPPORTING FUNCTIONS ====================
+        
         function generateDeviceId() {
             const id = 'device_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
             localStorage.setItem('deviceId', id);
             return id;
         }
 
-        // Alert system
         function showAlert(title, message, type = 'info', duration = 4000) {
             const alert = document.createElement("div");
             alert.className = `alert ${type}`;
@@ -1431,7 +1725,6 @@
             return alert;
         }
 
-        // Check if username is available
         async function isUsernameAvailable(username) {
             const savedUsername = localStorage.getItem('savedUsername');
             const savedDeviceId = localStorage.getItem('savedDeviceId');
@@ -1450,7 +1743,6 @@
             return data.length === 0;
         }
 
-        // Update online status
         async function updateOnlineStatus() {
             if (!username) return;
             
@@ -1463,7 +1755,8 @@
             chatUsers.set(username, { 
                 lastSeen: timestamp, 
                 online: true,
-                lastUpdated: now 
+                lastUpdated: now,
+                peerId: myPeerId
             });
             
             if (callChannel) {
@@ -1474,7 +1767,8 @@
                         username, 
                         status: 'online',
                         lastSeen: timestamp,
-                        timestamp: now
+                        timestamp: now,
+                        peerId: myPeerId
                     }
                 });
             }
@@ -1482,7 +1776,6 @@
             updateUserList();
         }
 
-        // Check for offline users
         function checkOfflineUsers() {
             const now = Date.now();
             chatUsers.forEach((userData, user) => {
@@ -1498,7 +1791,6 @@
             });
         }
 
-        // Utility functions
         function getUserColor(name) {
             if (!colorMap[name]) {
                 let hash = 0;
@@ -1582,7 +1874,6 @@
             return separator;
         }
 
-        // Auto-login if username is saved
         function checkAutoLogin() {
             const savedUsername = localStorage.getItem('savedUsername');
             const savedDeviceId = localStorage.getItem('savedDeviceId');
@@ -1599,7 +1890,93 @@
             }
         }
 
-        // Perform the login process
+        function setupCallChannel() {
+            callChannel = supabase.channel("webrtc-calls");
+            
+            callChannel.subscribe();
+            
+            // Handle peer ID sharing
+            callChannel.on("broadcast", { event: "peer-id" }, (payload) => {
+                const { username: user, peerId } = payload.payload;
+                
+                if (user !== username) {
+                    if (chatUsers.has(user)) {
+                        const userData = chatUsers.get(user);
+                        userData.peerId = peerId;
+                        chatUsers.set(user, userData);
+                        updateUserList();
+                    }
+                }
+            });
+            
+            // Handle online status
+            callChannel.on("broadcast", { event: "online-status" }, (payload) => {
+                const { username: user, status, lastSeen, timestamp, peerId } = payload.payload;
+                
+                if (user !== username) {
+                    const now = Date.now();
+                    chatUsers.set(user, { 
+                        lastSeen, 
+                        online: status === 'online',
+                        lastUpdated: timestamp || now,
+                        peerId: peerId
+                    });
+                    updateUserList();
+                }
+            });
+            
+            // Handle private messages
+            callChannel.on("broadcast", { event: "private-message" }, (payload) => {
+                const { from, to, message, timestamp, messageId } = payload.payload;
+                
+                if (to !== username) return;
+                
+                const chatKey = [from, to].sort().join('_');
+                if (privateChatHistory[chatKey]) {
+                    const isDuplicate = privateChatHistory[chatKey].some(msg => 
+                        msg.message === message && 
+                        msg.from === from && 
+                        Math.abs(new Date(msg.timestamp) - new Date(timestamp)) < 1000
+                    );
+                    if (isDuplicate) return;
+                }
+                
+                if (from === currentPrivateChatWith) {
+                    addPrivateMessageToChat(from, message, timestamp, false);
+                }
+                
+                if (!privateChatHistory[chatKey]) {
+                    privateChatHistory[chatKey] = [];
+                }
+                privateChatHistory[chatKey].push({
+                    from,
+                    message,
+                    timestamp,
+                    isSent: false,
+                    messageId: messageId || Date.now()
+                });
+                
+                savePrivateMessages();
+                
+                if (from !== username && currentPrivateChatWith !== from) {
+                    showAlert("Private Message", `${from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`, "info");
+                }
+            });
+            
+            // Handle typing indicator
+            callChannel.on("broadcast", { event: "user-typing" }, (payload) => {
+                const { username: user, isTyping } = payload.payload;
+                
+                if (user !== username) {
+                    if (isTyping) {
+                        typingIndicator.textContent = `${user} is typing...`;
+                    } else {
+                        typingIndicator.textContent = '';
+                    }
+                }
+            });
+        }
+
         async function performLogin(name) {
             const isAvailable = await isUsernameAvailable(name);
             
@@ -1634,6 +2011,7 @@
             loadPrivateMessages();
             setupEventListeners();
             setupCallChannel();
+            initializePeerJS();
             
             onlineCheckInterval = setInterval(() => {
                 updateOnlineStatus();
@@ -1654,570 +2032,14 @@
             showAlert("Welcome!", `${randomGreeting} You're now chatting as ${username}`, "success");
         }
 
-        // ==================== FIXED WEBRTC CALL LOGIC ====================
-        
-        /* ------------------ MEDIA ------------------ */
-        async function getMedia() {
-            try {
-                localStream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        width: { ideal: 640 },
-                        height: { ideal: 480 },
-                        facingMode: "user"
-                    },
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    }
-                });
-                localVideo.srcObject = localStream;
-                localLabel.textContent = `${username} (You)`;
-                console.log('✅ Got local media');
-                return true;
-            } catch (error) {
-                console.error('❌ Error getting media:', error);
-                showAlert("Media Error", "Could not access camera/microphone. Please check permissions.", "error");
-                return false;
-            }
-        }
-
-        /* ------------------ PEER CONNECTION ------------------ */
-        function createPeer(remoteUser) {
-            const configuration = {
-                iceServers: [
-                    { urls: "stun:stun.l.google.com:19302" },
-                    { urls: "stun:stun1.l.google.com:19302" },
-                    { urls: "stun:stun2.l.google.com:19302" }
-                ]
-            };
-            
-            peerConnection = new RTCPeerConnection(configuration);
-
-            // Add local tracks
-            if (localStream) {
-                localStream.getTracks().forEach(track => {
-                    peerConnection.addTrack(track, localStream);
-                    console.log(`Added ${track.kind} track to peer connection`);
-                });
-            }
-
-            // Handle incoming remote stream - FIXED
-            peerConnection.ontrack = (event) => {
-                console.log('📡 Received remote track:', event.track.kind);
-                if (event.streams && event.streams[0]) {
-                    remoteVideo.srcObject = event.streams[0];
-                    remoteLabel.textContent = remoteUser;
-                    console.log('✅ Remote video stream set');
-                }
-            };
-
-            // Handle ICE candidates
-            peerConnection.onicecandidate = (event) => {
-                if (event.candidate && callChannel && currentCall) {
-                    console.log('🧊 Sending ICE candidate');
-                    callChannel.send({
-                        type: "broadcast",
-                        event: "ice-candidate",
-                        payload: { 
-                            to: currentCall, 
-                            from: username, 
-                            candidate: event.candidate 
-                        }
-                    });
-                }
-            };
-
-            // Handle connection state changes
-            peerConnection.onconnectionstatechange = () => {
-                console.log('🔗 Connection state:', peerConnection.connectionState);
-                if (peerConnection.connectionState === 'connected') {
-                    showAlert("Call Connected", "You are now connected!", "success", 2000);
-                } else if (peerConnection.connectionState === 'failed' || 
-                          peerConnection.connectionState === 'disconnected' ||
-                          peerConnection.connectionState === 'closed') {
-                    console.log('❌ Call disconnected');
-                    endVideoCall();
-                }
-            };
-
-            // Handle ICE connection state
-            peerConnection.oniceconnectionstatechange = () => {
-                console.log('🧊 ICE connection state:', peerConnection.iceConnectionState);
-            };
-        }
-
-        /* ------------------ DECLINE CALL ------------------ */
-        function declineCall() {
-            if (pendingCaller && callChannel) {
-                callChannel.send({
-                    type: "broadcast",
-                    event: "call-declined",
-                    payload: { from: username, to: pendingCaller }
-                });
-            }
-            callPopup.style.display = 'none';
-            pendingCaller = null;
-            pendingCallOffer = null;
-            if (callTimeout) clearTimeout(callTimeout);
-        }
-
-        /* ------------------ SETUP CALL CHANNEL ------------------ */
-        function setupCallChannel() {
-            callChannel = supabase.channel("webrtc-calls");
-            
-            callChannel.subscribe();
-            
-            // Handle incoming call offers
-            callChannel.on("broadcast", { event: "offer" }, async ({ payload }) => {
-                if (payload.to !== username) return;
-                
-                console.log('📞 Call offer from:', payload.from);
-                pendingCaller = payload.from;
-                pendingCallOffer = payload.offer;
-                
-                // Show call popup
-                callerName.textContent = payload.from;
-                callPopup.style.display = 'flex';
-                showAlert("Incoming Call", `${payload.from} is calling you`, "info");
-                
-                // Auto decline after 30 seconds
-                if (callTimeout) clearTimeout(callTimeout);
-                callTimeout = setTimeout(() => {
-                    if (callPopup.style.display === 'flex') {
-                        declineCall();
-                        showAlert("Call Missed", `Missed call from ${payload.from}`, "warning");
-                    }
-                }, 30000);
-            });
-
-            // Handle call answers
-            callChannel.on("broadcast", { event: "answer" }, async ({ payload }) => {
-                if (payload.to !== username || currentCall !== payload.from) return;
-                
-                console.log('✅ Call answered by:', payload.from);
-                try {
-                    if (peerConnection && peerConnection.signalingState === "have-local-offer") {
-                        const remoteDesc = new RTCSessionDescription(payload.answer);
-                        await peerConnection.setRemoteDescription(remoteDesc);
-                        remoteLabel.textContent = payload.from;
-                        showAlert("Call Connected", `${payload.from} accepted your call!`, "success");
-                        
-                        // Clear timeout since call was answered
-                        if (callTimeout) clearTimeout(callTimeout);
-                    }
-                } catch (error) {
-                    console.error("Error setting remote description:", error);
-                }
-            });
-
-            // Handle ICE candidates - FIXED
-            callChannel.on("broadcast", { event: "ice-candidate" }, async ({ payload }) => {
-                if (payload.to !== username || currentCall !== payload.from) return;
-                
-                try {
-                    if (peerConnection && peerConnection.remoteDescription) {
-                        await peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
-                        console.log('✅ Added ICE candidate from', payload.from);
-                    }
-                } catch (error) {
-                    console.error("Error adding ICE candidate:", error);
-                }
-            });
-
-            // Handle call declined
-            callChannel.on("broadcast", { event: "call-declined" }, ({ payload }) => {
-                if (payload.to === username && currentCall === payload.from) {
-                    console.log('❌ Call declined by remote');
-                    showAlert("Call Declined", `${payload.from} declined the call`, "error");
-                    endVideoCall();
-                }
-            });
-
-            // Handle call ended
-            callChannel.on("broadcast", { event: "call-ended" }, ({ payload }) => {
-                if (payload.to === username && currentCall === payload.from) {
-                    console.log('📞 Call ended by remote');
-                    showAlert("Call Ended", `${payload.from} ended the call`, "info");
-                    endVideoCall();
-                }
-            });
-            
-            // Online status broadcasting
-            callChannel.on("broadcast", { event: "online-status" }, (payload) => {
-                const { username: user, status, lastSeen, timestamp } = payload.payload;
-                
-                if (user !== username) {
-                    const now = Date.now();
-                    chatUsers.set(user, { 
-                        lastSeen, 
-                        online: status === 'online',
-                        lastUpdated: timestamp || now
-                    });
-                    updateUserList();
-                }
-            });
-            
-            // Private messages with duplicate prevention
-            callChannel.on("broadcast", { event: "private-message" }, (payload) => {
-                const { from, to, message, timestamp, messageId } = payload.payload;
-                
-                if (to !== username) return;
-                
-                // Check for duplicate message
-                const chatKey = [from, to].sort().join('_');
-                if (privateChatHistory[chatKey]) {
-                    const isDuplicate = privateChatHistory[chatKey].some(msg => 
-                        msg.message === message && 
-                        msg.from === from && 
-                        Math.abs(new Date(msg.timestamp) - new Date(timestamp)) < 1000
-                    );
-                    if (isDuplicate) return;
-                }
-                
-                // Add to private chat if open
-                if (from === currentPrivateChatWith) {
-                    addPrivateMessageToChat(from, message, timestamp, false);
-                }
-                
-                // Store in history
-                if (!privateChatHistory[chatKey]) {
-                    privateChatHistory[chatKey] = [];
-                }
-                privateChatHistory[chatKey].push({
-                    from,
-                    message,
-                    timestamp,
-                    isSent: false,
-                    messageId: messageId || Date.now()
-                });
-                
-                // Save to localStorage
-                savePrivateMessages();
-                
-                // Show notification if chat is not open
-                if (from !== username && currentPrivateChatWith !== from) {
-                    showAlert("Private Message", `${from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`, "info");
-                }
-            });
-            
-            // Typing indicator
-            callChannel.on("broadcast", { event: "user-typing" }, (payload) => {
-                const { username: user, isTyping } = payload.payload;
-                
-                if (user !== username) {
-                    if (isTyping) {
-                        typingIndicator.textContent = `${user} is typing...`;
-                    } else {
-                        typingIndicator.textContent = '';
-                    }
-                }
-            });
-        }
-
-        /* ------------------ START CALL ------------------ */
-        window.initiateCall = async function (targetUser) {
-            if (callCooldown) {
-                // Don't show alert, just silently ignore
-                return;
-            }
-            
-            if (!callChannel) {
-                showAlert("Error", "Call system not initialized", "error");
-                return;
-            }
-            
-            if (isInCall) {
-                showAlert("Already in Call", "Please end your current call first", "warning");
-                return;
-            }
-            
-            if (targetUser === username) {
-                showAlert("Can't Call Yourself", "You can't start a video call with yourself!", "warning");
-                return;
-            }
-            
-            const userData = chatUsers.get(targetUser);
-            if (!userData || !userData.online) {
-                showAlert("User Offline", `${targetUser} is currently offline`, "error");
-                return;
-            }
-            
-            currentCall = targetUser;
-            
-            try {
-                console.log('📞 Initiating call to:', targetUser);
-                
-                // Get local media
-                const mediaSuccess = await getMedia();
-                if (!mediaSuccess) {
-                    currentCall = null;
-                    return;
-                }
-                
-                // Create peer connection
-                createPeer(targetUser);
-                
-                // Create offer
-                const offerOptions = {
-                    offerToReceiveAudio: true,
-                    offerToReceiveVideo: true
-                };
-                
-                const offer = await peerConnection.createOffer(offerOptions);
-                await peerConnection.setLocalDescription(offer);
-                
-                // Send call request
-                callChannel.send({
-                    type: "broadcast",
-                    event: "offer",
-                    payload: { 
-                        to: targetUser, 
-                        from: username, 
-                        offer: offer 
-                    }
-                });
-                
-                // Show call UI
-                videoContainer.style.display = 'flex';
-                isInCall = true;
-                remoteLabel.textContent = `Calling ${targetUser}...`;
-                
-                // Set cooldown
-                callCooldown = true;
-                setTimeout(() => {
-                    callCooldown = false;
-                }, 3000);
-                
-                // Auto cancel after 45 seconds if no answer
-                if (callTimeout) clearTimeout(callTimeout);
-                callTimeout = setTimeout(() => {
-                    if (isInCall && currentCall === targetUser && !remoteVideo.srcObject) {
-                        showAlert("Call Not Answered", `${targetUser} did not answer the call`, "warning");
-                        endVideoCall();
-                    }
-                }, 45000);
-                
-            } catch (error) {
-                console.error("❌ Error starting call:", error);
-                showAlert("Call Failed", error.message || "Could not start call", "error");
-                currentCall = null;
-                if (localStream) {
-                    localStream.getTracks().forEach(track => track.stop());
-                    localStream = null;
-                }
-                if (peerConnection) {
-                    peerConnection.close();
-                    peerConnection = null;
-                }
-                callCooldown = false;
-            }
-        };
-
-        /* ------------------ ACCEPT CALL ------------------ */
-        async function acceptCall() {
-            console.log('✅ Accepting call from:', pendingCaller);
-            callPopup.style.display = 'none';
-            if (callTimeout) clearTimeout(callTimeout);
-            
-            if (pendingCaller && callChannel) {
-                try {
-                    // Get local media
-                    const mediaSuccess = await getMedia();
-                    if (!mediaSuccess) {
-                        pendingCaller = null;
-                        pendingCallOffer = null;
-                        return;
-                    }
-                    
-                    // Create peer connection
-                    createPeer(pendingCaller);
-                    currentCall = pendingCaller;
-                    
-                    // Set remote description from stored offer
-                    if (pendingCallOffer) {
-                        const remoteDesc = new RTCSessionDescription(pendingCallOffer);
-                        await peerConnection.setRemoteDescription(remoteDesc);
-                        
-                        // Create and send answer
-                        const answer = await peerConnection.createAnswer();
-                        await peerConnection.setLocalDescription(answer);
-                        
-                        callChannel.send({
-                            type: "broadcast",
-                            event: "answer",
-                            payload: { 
-                                to: currentCall, 
-                                from: username, 
-                                answer: answer 
-                            }
-                        });
-                        
-                        // Show call UI
-                        videoContainer.style.display = 'flex';
-                        isInCall = true;
-                        remoteLabel.textContent = currentCall;
-                        
-                        showAlert("Call Accepted", `You accepted the call from ${currentCall}`, "success");
-                    }
-                    
-                } catch (error) {
-                    console.error("❌ Error accepting call:", error);
-                    showAlert("Call Failed", error.message || "Could not accept call", "error");
-                    currentCall = null;
-                    endVideoCall();
-                }
-            }
-            
-            pendingCaller = null;
-            pendingCallOffer = null;
-        }
-
-        /* ------------------ CALL CONTROLS ------------------ */
-        function toggleMute() {
-            if (!localStream) return;
-            
-            const audioTracks = localStream.getAudioTracks();
-            if (audioTracks.length > 0) {
-                isMuted = !isMuted;
-                audioTracks[0].enabled = !isMuted;
-                
-                if (isMuted) {
-                    callMuteBtn.innerHTML = '<i class="fas fa-microphone-slash"></i> Unmute';
-                    callMuteBtn.style.background = '#e74c3c';
-                } else {
-                    callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
-                    callMuteBtn.style.background = '#f39c12';
-                }
-            }
-        }
-
-        function toggleShareScreen() {
-            if (!isSharing) {
-                navigator.mediaDevices.getDisplayMedia({ video: true })
-                    .then(stream => {
-                        isSharing = true;
-                        screenStream = stream;
-                        callShareBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Share';
-                        callShareBtn.style.background = '#e74c3c';
-                        
-                        const track = screenStream.getVideoTracks()[0];
-                        const sender = peerConnection.getSenders().find(s => s.track.kind === "video");
-                        if (sender) {
-                            sender.replaceTrack(track);
-                        }
-                        
-                        track.onended = () => toggleShareScreen();
-                    })
-                    .catch(err => {
-                        console.error('Error sharing screen:', err);
-                        showAlert("Share Failed", "Could not share screen", "error");
-                    });
-            } else {
-                isSharing = false;
-                callShareBtn.innerHTML = '<i class="fas fa-share-square"></i> Share';
-                callShareBtn.style.background = '#2ecc71';
-                
-                if (screenStream) {
-                    screenStream.getTracks().forEach(t => t.stop());
-                    screenStream = null;
-                }
-                
-                if (localStream) {
-                    const camTrack = localStream.getVideoTracks()[0];
-                    const sender = peerConnection.getSenders().find(s => s.track.kind === "video");
-                    if (sender && camTrack) {
-                        sender.replaceTrack(camTrack);
-                    }
-                }
-            }
-        }
-
-        function toggleFullscreen() {
-            if (!document.fullscreenElement) {
-                if (videoContainer.requestFullscreen) {
-                    videoContainer.requestFullscreen();
-                }
-                videoContainer.classList.add('fullscreen');
-                isFullscreen = true;
-                callFullscreenBtn.innerHTML = '<i class="fas fa-compress"></i> Exit Fullscreen';
-                callFullscreenBtn.style.background = '#e74c3c';
-            } else {
-                if (document.exitFullscreen) {
-                    document.exitFullscreen();
-                }
-                videoContainer.classList.remove('fullscreen');
-                isFullscreen = false;
-                callFullscreenBtn.innerHTML = '<i class="fas fa-expand"></i> Fullscreen';
-                callFullscreenBtn.style.background = '#3498db';
-            }
-        }
-
-        function endVideoCall() {
-            console.log('📞 Ending call');
-            
-            if (callTimeout) clearTimeout(callTimeout);
-            
-            if (peerConnection) {
-                peerConnection.close();
-                peerConnection = null;
-            }
-            
-            if (localStream) {
-                localStream.getTracks().forEach(track => track.stop());
-                localStream = null;
-            }
-            
-            if (screenStream) {
-                screenStream.getTracks().forEach(track => track.stop());
-                screenStream = null;
-            }
-            
-            if (callChannel && currentCall) {
-                callChannel.send({
-                    type: "broadcast",
-                    event: "call-ended",
-                    payload: { from: username, to: currentCall }
-                });
-            }
-            
-            videoContainer.style.display = 'none';
-            isInCall = false;
-            currentCall = null;
-            isMuted = false;
-            isSharing = false;
-            isFullscreen = false;
-            
-            // Reset buttons
-            callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
-            callMuteBtn.style.background = '#f39c12';
-            callShareBtn.innerHTML = '<i class="fas fa-share-square"></i> Share';
-            callShareBtn.style.background = '#2ecc71';
-            callFullscreenBtn.innerHTML = '<i class="fas fa-expand"></i> Fullscreen';
-            callFullscreenBtn.style.background = '#3498db';
-            
-            // Set cooldown
-            callCooldown = true;
-            setTimeout(() => {
-                callCooldown = false;
-            }, 3000);
-        }
-
         // ==================== COOLDOWN SYSTEM ====================
         
-        /* ------------------ SEND MESSAGE WITH COOLDOWN ------------------ */
         async function sendMessage() {
-            if (messageCooldown) {
-                // Silently ignore instead of showing alert
-                return;
-            }
+            if (messageCooldown) return;
             
             const text = messageInput.value.trim();
-            if (!text) {
-                return;
-            }
+            if (!text) return;
             
-            // Set cooldown
             messageCooldown = true;
             startCooldownTimer(sendBtn, 1);
             
@@ -2232,7 +2054,6 @@
                 console.error("Error sending message:", error);
             }
             
-            // Clear cooldown after 1 second
             setTimeout(() => {
                 messageCooldown = false;
                 sendBtn.disabled = false;
@@ -2240,29 +2061,20 @@
             }, 1000);
         }
 
-        /* ------------------ SEND PRIVATE MESSAGE WITH COOLDOWN ------------------ */
         async function sendPrivateMessage() {
-            if (privateMessageCooldown) {
-                // Silently ignore instead of showing alert
-                return;
-            }
+            if (privateMessageCooldown) return;
             
             const text = privateMessageInput.value.trim();
-            if (!text || !currentPrivateChatWith) {
-                return;
-            }
+            if (!text || !currentPrivateChatWith) return;
             
-            // Set cooldown
             privateMessageCooldown = true;
             startCooldownTimer(sendPrivateBtn, 1);
             
             const timestamp = new Date().toISOString();
             const messageId = Date.now();
             
-            // Add to UI immediately
             addPrivateMessageToChat(username, text, timestamp, true);
             
-            // Store in history
             const chatKey = [username, currentPrivateChatWith].sort().join('_');
             if (!privateChatHistory[chatKey]) {
                 privateChatHistory[chatKey] = [];
@@ -2275,10 +2087,8 @@
                 messageId
             });
             
-            // Save to localStorage
             savePrivateMessages();
             
-            // Send via signaling channel
             if (callChannel) {
                 callChannel.send({
                     type: 'broadcast',
@@ -2295,7 +2105,6 @@
             
             privateMessageInput.value = '';
             
-            // Clear cooldown after 1 second
             setTimeout(() => {
                 privateMessageCooldown = false;
                 sendPrivateBtn.disabled = false;
@@ -2303,7 +2112,6 @@
             }, 1000);
         }
 
-        /* ------------------ COOLDOWN TIMER ------------------ */
         function startCooldownTimer(button, seconds) {
             button.disabled = true;
             let timeLeft = seconds;
@@ -2331,47 +2139,38 @@
             }
         }
 
-        // ==================== KEYBOARD SHORTCUTS ====================
         function setupKeyboardShortcuts() {
             document.addEventListener('keydown', (e) => {
-                // Press ] to open password modal from nature site
                 if (e.key === ']' && natureSite.style.display !== 'none') {
                     e.preventDefault();
                     passwordModal.style.display = 'flex';
                     passwordInput.focus();
                 }
                 
-                // Press Shift+J to toggle between nature site and chat
                 if (e.key === 'J' && e.shiftKey) {
                     e.preventDefault();
                     if (natureSite.style.display !== 'none') {
-                        // If on nature site and password is unlocked, go to chat
                         if (isPasswordUnlocked) {
                             natureSite.style.display = 'none';
                             loginScreen.style.display = 'flex';
                         }
                     } else if (mainApp.style.display !== 'none') {
-                        // If in chat, go back to nature site
                         mainApp.style.display = 'none';
                         natureSite.style.display = 'flex';
                     } else if (loginScreen.style.display !== 'none') {
-                        // If in login screen, go back to nature site
                         loginScreen.style.display = 'none';
                         natureSite.style.display = 'flex';
                     }
                 }
                 
-                // Close password modal with Escape
                 if (e.key === 'Escape' && passwordModal.style.display === 'flex') {
                     passwordModal.style.display = 'none';
                 }
                 
-                // Close private chat with Escape
                 if (e.key === 'Escape' && privateChatModal.style.display === 'flex') {
                     privateChatModal.style.display = 'none';
                 }
                 
-                // Send message with Enter in private chat
                 if (e.key === 'Enter' && privateChatModal.style.display === 'flex' && 
                     document.activeElement === privateMessageInput) {
                     sendPrivateMessage();
@@ -2381,7 +2180,6 @@
 
         // ==================== EVENT LISTENERS ====================
         
-        // Login functionality
         loginBtn.addEventListener('click', async function() {
             const name = usernameInput.value.trim();
             if (!name) {
@@ -2402,7 +2200,6 @@
             await performLogin(name);
         });
 
-        // Username input validation
         usernameInput.addEventListener('input', async function() {
             const name = this.value.trim();
             if (name.length >= 2) {
@@ -2417,7 +2214,6 @@
             }
         });
 
-        // Password submission
         passwordSubmit.addEventListener('click', function() {
             const password = passwordInput.value.trim();
             if (password === 'BRUHISKING') {
@@ -2426,7 +2222,6 @@
                 passwordModal.style.display = 'none';
                 passwordInput.value = '';
                 
-                // Switch to login screen
                 natureSite.style.display = 'none';
                 loginScreen.style.display = 'flex';
                 
@@ -2438,22 +2233,18 @@
             }
         });
 
-        // Password input Enter key
         passwordInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 passwordSubmit.click();
             }
         });
 
-        // Setup event listeners
         function setupEventListeners() {
-            // Message sending with cooldown
             sendBtn.addEventListener('click', sendMessage);
             messageInput.addEventListener('keypress', e => {
                 if (e.key === 'Enter') sendMessage();
             });
 
-            // Typing indicator
             let typingTimeout;
             messageInput.addEventListener('input', function() {
                 if (callChannel && username) {
@@ -2477,31 +2268,22 @@
                 }
             });
 
-            // Search messages
             searchMessages.addEventListener('input', filterMessages);
 
-            // Refresh button
             refreshBtn.addEventListener('click', function() {
                 loadMessages();
                 showAlert("Refreshed!", "Messages updated successfully", "success");
             });
 
-            // Call popup buttons
-            callYes.addEventListener('click', acceptCall);
-            callNo.addEventListener('click', declineCall);
-
-            // Video call controls
             callMuteBtn.addEventListener('click', toggleMute);
             callFullscreenBtn.addEventListener('click', toggleFullscreen);
             callShareBtn.addEventListener('click', toggleShareScreen);
             callHangupBtn.addEventListener('click', endVideoCall);
 
-            // User profile click in header
             document.getElementById('account-btn').addEventListener('click', function() {
                 showUserInfo(username);
             });
 
-            // Private chat controls
             sendPrivateBtn.addEventListener('click', sendPrivateMessage);
             privateMessageInput.addEventListener('keypress', e => {
                 if (e.key === 'Enter') sendPrivateMessage();
@@ -2511,7 +2293,6 @@
                 currentPrivateChatWith = null;
             });
 
-            // Track page visibility for online status
             document.addEventListener('visibilitychange', function() {
                 if (document.visibilityState === 'visible') {
                     updateOnlineStatus();
@@ -2528,22 +2309,23 @@
                 }
             });
 
-            // Update online status on mouse movement
             document.addEventListener('mousemove', function() {
                 if (username) {
                     updateOnlineStatus();
                 }
             });
 
-            // Clean up resources when page is unloaded
             window.addEventListener('beforeunload', function() {
                 cleanupAllResources();
             });
         }
 
-        // Clean up all resources
         function cleanupAllResources() {
-            endVideoCall(); // Clean up call resources
+            endVideoCall();
+            
+            if (myPeer) {
+                myPeer.destroy();
+            }
             
             if (onlineCheckInterval) {
                 clearInterval(onlineCheckInterval);
@@ -2564,7 +2346,6 @@
             }
         }
 
-        // ==================== USER INFO MODAL ====================
         function showUserInfo(user) {
             const modal = document.createElement('div');
             modal.className = 'profile-modal';
@@ -2647,15 +2428,11 @@
             });
         }
 
-        // ==================== PRIVATE CHAT FUNCTIONS ====================
-        
-        // Open private chat with user
         function openPrivateChat(user) {
             currentPrivateChatWith = user;
             privateChatTitle.textContent = `Private Chat with ${user}`;
             privateChatMessages.innerHTML = '';
             
-            // Load existing messages
             const chatKey = [username, user].sort().join('_');
             if (privateChatHistory[chatKey]) {
                 privateChatHistory[chatKey].forEach(msg => {
@@ -2666,13 +2443,11 @@
             privateChatModal.style.display = 'flex';
             privateMessageInput.focus();
             
-            // Scroll to bottom
             setTimeout(() => {
                 privateChatMessages.scrollTop = privateChatMessages.scrollHeight;
             }, 100);
         }
 
-        // Add private message to chat UI
         function addPrivateMessageToChat(sender, message, timestamp, isSent) {
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message ' + (isSent ? 'sent' : 'received');
@@ -2710,13 +2485,11 @@
             
             privateChatMessages.appendChild(messageDiv);
             
-            // Scroll to bottom
             setTimeout(() => {
                 privateChatMessages.scrollTop = privateChatMessages.scrollHeight;
             }, 100);
         }
 
-        // Load private messages from localStorage
         function loadPrivateMessages() {
             const saved = localStorage.getItem('privateChatHistory');
             if (saved) {
@@ -2729,7 +2502,6 @@
             }
         }
 
-        // Save private messages to localStorage
         function savePrivateMessages() {
             try {
                 localStorage.setItem('privateChatHistory', JSON.stringify(privateChatHistory));
@@ -2738,8 +2510,6 @@
             }
         }
 
-        // ==================== MESSAGE RENDERING ====================
-        
         function renderMessage(msg) {
             const messageDiv = document.createElement('div');
             const isSent = username === msg.username;
@@ -2857,8 +2627,6 @@
             }
         }
 
-        // ==================== USER LIST FUNCTIONS ====================
-        
         function updateUserList() {
             usersContainer.innerHTML = '';
             
@@ -2896,7 +2664,7 @@
             
             let statusText = '';
             if (userData.online) {
-                statusText = 'Online • Active now';
+                statusText = 'Online • Ready for calls';
             } else if (userData.lastUpdated > 0) {
                 const now = Date.now();
                 const diff = now - userData.lastUpdated;
@@ -2931,8 +2699,6 @@
             container.appendChild(userItem);
         }
 
-        // ==================== SUPABASE SUBSCRIPTIONS ====================
-        
         supabase.channel('messages')
             .on('postgres_changes', {
                 event: 'INSERT',
@@ -2949,14 +2715,11 @@
             })
             .subscribe();
 
-        // ==================== INITIALIZATION ====================
-        
         function initialize() {
             setupKeyboardShortcuts();
             checkAutoLogin();
             loadPrivateMessages();
             
-            // Make nature site scrollable
             natureSite.style.overflowY = 'auto';
             natureSite.style.height = '100vh';
         }
