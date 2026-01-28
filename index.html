@@ -734,6 +734,7 @@
             position: relative;
             transition: all 0.3s ease;
             cursor: pointer;
+            min-height: 100px;
         }
 
         .video-wrapper:hover {
@@ -1285,6 +1286,7 @@
         const callHangupBtn = document.getElementById('callHangupBtn');
         const localVideoWrapper = document.getElementById('local-video-wrapper');
         const remoteVideoWrapper = document.getElementById('remote-video-wrapper');
+        const callVideos = document.getElementById('callVideos');
 
         // App State
         let username = '';
@@ -1311,6 +1313,8 @@
         let callCooldown = false;
         let currentCallTarget = null;
         let focusedVideo = null;
+        let screenStream = null;
+        let isScreenSharing = false;
 
         // Cooldown states
         let messageCooldown = false;
@@ -1321,7 +1325,9 @@
         // ==================== VIDEO FOCUS FUNCTIONALITY ====================
         
         function setupVideoFocus() {
-            localVideoWrapper.addEventListener('click', () => {
+            localVideoWrapper.addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent event bubbling
+                
                 if (focusedVideo === 'local') {
                     // Reset focus
                     localVideoWrapper.classList.remove('focused');
@@ -1333,9 +1339,14 @@
                     remoteVideoWrapper.classList.add('minimized');
                     focusedVideo = 'local';
                 }
+                
+                // Update the call videos container
+                updateVideoLayout();
             });
             
-            remoteVideoWrapper.addEventListener('click', () => {
+            remoteVideoWrapper.addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent event bubbling
+                
                 if (focusedVideo === 'remote') {
                     // Reset focus
                     remoteVideoWrapper.classList.remove('focused');
@@ -1347,7 +1358,35 @@
                     localVideoWrapper.classList.add('minimized');
                     focusedVideo = 'remote';
                 }
+                
+                // Update the call videos container
+                updateVideoLayout();
             });
+        }
+
+        function updateVideoLayout() {
+            if (focusedVideo === 'local') {
+                localVideoWrapper.style.flex = '3';
+                remoteVideoWrapper.style.flex = '0.5';
+                localVideoWrapper.style.zIndex = '2';
+                remoteVideoWrapper.style.zIndex = '1';
+                localVideoWrapper.style.opacity = '1';
+                remoteVideoWrapper.style.opacity = '0.7';
+            } else if (focusedVideo === 'remote') {
+                localVideoWrapper.style.flex = '0.5';
+                remoteVideoWrapper.style.flex = '3';
+                localVideoWrapper.style.zIndex = '1';
+                remoteVideoWrapper.style.zIndex = '2';
+                localVideoWrapper.style.opacity = '0.7';
+                remoteVideoWrapper.style.opacity = '1';
+            } else {
+                localVideoWrapper.style.flex = '1';
+                remoteVideoWrapper.style.flex = '1';
+                localVideoWrapper.style.zIndex = '1';
+                remoteVideoWrapper.style.zIndex = '1';
+                localVideoWrapper.style.opacity = '1';
+                remoteVideoWrapper.style.opacity = '1';
+            }
         }
 
         // ==================== SIMPLEPEER CALL SYSTEM ====================
@@ -1356,13 +1395,14 @@
             console.log('📞 Call system initialized');
         }
 
-        async function getMediaStream() {
+        async function getMediaStream(videoConstraints = {}) {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         width: { ideal: 640 },
                         height: { ideal: 480 },
-                        facingMode: "user"
+                        facingMode: "user",
+                        ...videoConstraints
                     },
                     audio: {
                         echoCancellation: true,
@@ -1374,6 +1414,109 @@
                 console.error('Error accessing media:', error);
                 showAlert("Media Error", "Please allow camera and microphone access", "error");
                 throw error;
+            }
+        }
+
+        async function getScreenStream() {
+            try {
+                const stream = await navigator.mediaDevices.getDisplayMedia({
+                    video: {
+                        cursor: "always",
+                        displaySurface: "monitor"
+                    },
+                    audio: true
+                });
+                
+                // Handle when user stops sharing screen
+                stream.getVideoTracks()[0].onended = () => {
+                    if (isScreenSharing) {
+                        stopScreenShare();
+                    }
+                };
+                
+                return stream;
+            } catch (error) {
+                console.error('Error accessing screen:', error);
+                showAlert("Screen Share Error", "Could not share screen", "error");
+                throw error;
+            }
+        }
+
+        async function startScreenShare() {
+            if (isScreenSharing || !peer || !isInCall) {
+                return;
+            }
+            
+            try {
+                screenStream = await getScreenStream();
+                isScreenSharing = true;
+                
+                // Replace the video track in the peer connection
+                const screenTrack = screenStream.getVideoTracks()[0];
+                const sender = peer._senders.find(s => s.track && s.track.kind === 'video');
+                
+                if (sender) {
+                    sender.replaceTrack(screenTrack);
+                }
+                
+                // Update local video to show screen share
+                localVideo.srcObject = screenStream;
+                localLabel.textContent = `${username} (Sharing Screen)`;
+                
+                // Update share button
+                callShareBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Sharing';
+                callShareBtn.style.background = '#e74c3c';
+                
+                showAlert("Screen Sharing", "Your screen is now being shared", "success");
+                
+            } catch (error) {
+                console.error('Screen share failed:', error);
+                isScreenSharing = false;
+            }
+        }
+
+        async function stopScreenShare() {
+            if (!isScreenSharing) return;
+            
+            try {
+                // Stop screen stream
+                if (screenStream) {
+                    screenStream.getTracks().forEach(track => track.stop());
+                    screenStream = null;
+                }
+                
+                // Switch back to camera
+                if (localStream) {
+                    const cameraTrack = localStream.getVideoTracks()[0];
+                    const sender = peer._senders.find(s => s.track && s.track.kind === 'video');
+                    
+                    if (sender && cameraTrack) {
+                        sender.replaceTrack(cameraTrack);
+                    }
+                    
+                    // Update local video to show camera
+                    localVideo.srcObject = localStream;
+                    localLabel.textContent = `${username} (You)`;
+                }
+                
+                isScreenSharing = false;
+                
+                // Update share button
+                callShareBtn.innerHTML = '<i class="fas fa-share-square"></i> Share';
+                callShareBtn.style.background = '#2ecc71';
+                
+                showAlert("Screen Sharing", "Screen sharing stopped", "info");
+                
+            } catch (error) {
+                console.error('Error stopping screen share:', error);
+            }
+        }
+
+        async function toggleShareScreen() {
+            if (isScreenSharing) {
+                await stopScreenShare();
+            } else {
+                await startScreenShare();
             }
         }
 
@@ -1438,6 +1581,9 @@
                     isInCall = true;
                     currentCall = peer;
                     
+                    // Setup video focus after call is connected
+                    setupVideoFocus();
+                    
                     showAlert("Call Connected", `Connected to ${targetUser}`, "success", 2000);
                 });
                 
@@ -1455,6 +1601,9 @@
                 // Show call UI
                 videoContainer.style.display = 'flex';
                 remoteLabel.textContent = `Calling ${targetUser}...`;
+                
+                // Setup video focus for initial state
+                setupVideoFocus();
                 
                 // Set cooldown
                 callCooldown = true;
@@ -1555,6 +1704,9 @@
                             isInCall = true;
                             currentCall = peer;
                             
+                            // Setup video focus after call is connected
+                            setupVideoFocus();
+                            
                             showAlert("Call Connected", `Connected to ${from}`, "success", 2000);
                         });
                         
@@ -1571,6 +1723,9 @@
                         // Show call UI
                         videoContainer.style.display = 'flex';
                         remoteLabel.textContent = from;
+                        
+                        // Setup video focus for initial state
+                        setupVideoFocus();
                         
                         // Handle the offer signal
                         peer.signal(signal);
@@ -1677,6 +1832,11 @@
                 localVideo.srcObject = null;
             }
             
+            if (screenStream) {
+                screenStream.getTracks().forEach(track => track.stop());
+                screenStream = null;
+            }
+            
             if (remoteVideo.srcObject) {
                 remoteVideo.srcObject.getTracks().forEach(track => track.stop());
                 remoteVideo.srcObject = null;
@@ -1687,15 +1847,21 @@
             currentCall = null;
             currentCallTarget = null;
             isMuted = false;
+            isScreenSharing = false;
             
-            // Reset focus
+            // Reset video focus
             localVideoWrapper.classList.remove('focused', 'minimized');
             remoteVideoWrapper.classList.remove('focused', 'minimized');
             focusedVideo = null;
+            updateVideoLayout();
             
             // Reset mute button
             callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
             callMuteBtn.style.background = '#f39c12';
+            
+            // Reset share button
+            callShareBtn.innerHTML = '<i class="fas fa-share-square"></i> Share';
+            callShareBtn.style.background = '#2ecc71';
             
             // Reset labels
             remoteLabel.textContent = 'Waiting...';
@@ -1739,11 +1905,6 @@
                 callFullscreenBtn.innerHTML = '<i class="fas fa-expand"></i> Fullscreen';
                 callFullscreenBtn.style.background = '#3498db';
             }
-        }
-
-        function toggleShareScreen() {
-            // Screen sharing placeholder
-            showAlert("Coming Soon", "Screen sharing will be available soon", "info");
         }
 
         // ==================== SUPPORTING FUNCTIONS ====================
@@ -1980,7 +2141,7 @@
             loadPrivateMessages();
             setupEventListeners();
             setupCallChannel();
-            setupVideoFocus(); // Setup video focus functionality
+            setupVideoFocus();
             initializeCallSystem();
             
             onlineCheckInterval = setInterval(() => {
