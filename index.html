@@ -767,6 +767,7 @@
             padding: 3px 10px;
             border-radius: 15px;
             font-size: 12px;
+            z-index: 10;
         }
 
         .call-controls {
@@ -812,61 +813,6 @@
 
         #callHangupBtn:hover {
             background: #a93226;
-        }
-
-        /* Call Popup */
-        #callPopup {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(10px);
-            display: none;
-            justify-content: center;
-            align-items: center;
-            z-index: 2000;
-        }
-
-        #callPopupBox {
-            background: rgba(38, 70, 83, 0.95);
-            padding: 30px;
-            border-radius: var(--border-radius);
-            width: 320px;
-            text-align: center;
-            color: white;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .call-icon {
-            font-size: 3rem;
-            color: var(--success);
-            margin-bottom: 15px;
-        }
-
-        #callPopupBox button {
-            padding: 12px 24px;
-            border: none;
-            border-radius: 30px;
-            cursor: pointer;
-            font-weight: 600;
-            margin-top: 15px;
-            font-size: 14px;
-            transition: var(--transition);
-        }
-
-        #callYes {
-            background: var(--success);
-            color: white;
-            margin-right: 10px;
-        }
-
-        #callNo {
-            background: rgba(255, 255, 255, 0.1);
-            color: var(--light);
-            border: 1px solid rgba(255, 255, 255, 0.2);
         }
 
         /* Users list styling */
@@ -1229,25 +1175,6 @@
             </div>
         </div>
     </div>
-    
-    <!-- Call Popup - NO LONGER USED WITH PEERJS -->
-    <div id="callPopup" style="display: none;">
-        <div id="callPopupBox">
-            <div class="call-icon">
-                <i class="fas fa-video"></i>
-            </div>
-            <div id="callText" style="font-size: 1.2rem; margin-bottom: 5px;">Incoming Call</div>
-            <div style="color: var(--gray); margin-bottom: 20px; font-size: 0.9rem;" id="callerName">Loading...</div>
-            <button id="callYes">
-                <i class="fas fa-phone-alt"></i>
-                Accept
-            </button>
-            <button id="callNo">
-                <i class="fas fa-times"></i>
-                Decline
-            </button>
-        </div>
-    </div>
 
     <!-- Video Call Container -->
     <div id="videoCallContainer">
@@ -1258,7 +1185,7 @@
             </div>
             <div class="video-wrapper" id="remote-video-wrapper">
                 <video class="call-video" id="remoteVideo" autoplay playsinline></video>
-                <div class="video-label" id="remoteLabel">Remote</div>
+                <div class="video-label" id="remoteLabel">Waiting...</div>
             </div>
         </div>
         <div class="call-controls">
@@ -1306,8 +1233,8 @@
         </div>
     </div>
 
-    <!-- PeerJS Library -->
-    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <!-- SimplePeer Library (Simpler than PeerJS) -->
+    <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
 
     <script type="module">
         import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
@@ -1356,6 +1283,8 @@
         const callFullscreenBtn = document.getElementById('callFullscreenBtn');
         const callShareBtn = document.getElementById('callShareBtn');
         const callHangupBtn = document.getElementById('callHangupBtn');
+        const localVideoWrapper = document.getElementById('local-video-wrapper');
+        const remoteVideoWrapper = document.getElementById('remote-video-wrapper');
 
         // App State
         let username = '';
@@ -1371,123 +1300,84 @@
         let currentPrivateChatWith = null;
         let privateChatHistory = {};
 
-        // PEERJS Call State
-        let myPeer = null;
-        let myPeerId = null;
+        // SimplePeer Call State
         let currentCall = null;
         let isInCall = false;
         let localStream = null;
-        let callCooldown = false;
+        let peer = null;
+        let callChannel = null;
         let isMuted = false;
         let isFullscreen = false;
-        let isSharing = false;
-        let callChannel = null;
-        
+        let callCooldown = false;
+        let currentCallTarget = null;
+        let focusedVideo = null;
+
         // Cooldown states
         let messageCooldown = false;
         let privateMessageCooldown = false;
         let messageCooldownTimer = null;
         let privateMessageCooldownTimer = null;
 
-        // ==================== PEERJS CALL SYSTEM ====================
+        // ==================== VIDEO FOCUS FUNCTIONALITY ====================
         
-        function initializePeerJS() {
+        function setupVideoFocus() {
+            localVideoWrapper.addEventListener('click', () => {
+                if (focusedVideo === 'local') {
+                    // Reset focus
+                    localVideoWrapper.classList.remove('focused');
+                    remoteVideoWrapper.classList.remove('minimized');
+                    focusedVideo = null;
+                } else {
+                    // Focus on local
+                    localVideoWrapper.classList.add('focused');
+                    remoteVideoWrapper.classList.add('minimized');
+                    focusedVideo = 'local';
+                }
+            });
+            
+            remoteVideoWrapper.addEventListener('click', () => {
+                if (focusedVideo === 'remote') {
+                    // Reset focus
+                    remoteVideoWrapper.classList.remove('focused');
+                    localVideoWrapper.classList.remove('minimized');
+                    focusedVideo = null;
+                } else {
+                    // Focus on remote
+                    remoteVideoWrapper.classList.add('focused');
+                    localVideoWrapper.classList.add('minimized');
+                    focusedVideo = 'remote';
+                }
+            });
+        }
+
+        // ==================== SIMPLEPEER CALL SYSTEM ====================
+        
+        function initializeCallSystem() {
+            console.log('📞 Call system initialized');
+        }
+
+        async function getMediaStream() {
             try {
-                // Generate unique peer ID based on username
-                const peerId = `${username}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-                
-                myPeer = new Peer(peerId, {
-                    host: '0.peerjs.com',
-                    port: 443,
-                    path: '/',
-                    secure: true,
-                    debug: 3,
-                    config: {
-                        iceServers: [
-                            { urls: 'stun:stun.l.google.com:19302' },
-                            { urls: 'stun:stun1.l.google.com:19302' },
-                            { urls: 'stun:stun2.l.google.com:19302' }
-                        ]
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: "user"
+                    },
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true
                     }
                 });
-
-                myPeer.on('open', (id) => {
-                    myPeerId = id;
-                    console.log('✅ PeerJS connected with ID:', id);
-                    
-                    // Broadcast peer ID to all users
-                    if (callChannel) {
-                        callChannel.send({
-                            type: 'broadcast',
-                            event: 'peer-id',
-                            payload: {
-                                username: username,
-                                peerId: id,
-                                timestamp: Date.now()
-                            }
-                        });
-                    }
-                });
-
-                myPeer.on('call', (call) => {
-                    console.log('📞 Incoming call from:', call.peer);
-                    
-                    // Get media
-                    navigator.mediaDevices.getUserMedia({
-                        video: true,
-                        audio: true
-                    }).then(stream => {
-                        localStream = stream;
-                        localVideo.srcObject = stream;
-                        localLabel.textContent = `${username} (You)`;
-                        
-                        // Answer the call
-                        call.answer(stream);
-                        currentCall = call;
-                        isInCall = true;
-                        
-                        // Show call UI
-                        videoContainer.style.display = 'flex';
-                        remoteLabel.textContent = 'Caller';
-                        
-                        call.on('stream', (remoteStream) => {
-                            console.log('✅ Received remote stream');
-                            remoteVideo.srcObject = remoteStream;
-                            showAlert("Call Connected", "You are now in a call", "success", 2000);
-                        });
-                        
-                        call.on('close', () => {
-                            console.log('📞 Call closed by remote');
-                            endVideoCall();
-                        });
-                        
-                        call.on('error', (err) => {
-                            console.error('Call error:', err);
-                            endVideoCall();
-                        });
-                        
-                    }).catch(err => {
-                        console.error('Failed to get media:', err);
-                        showAlert("Media Error", "Could not access camera/microphone", "error");
-                    });
-                });
-
-                myPeer.on('error', (err) => {
-                    console.error('PeerJS error:', err);
-                    if (err.type === 'peer-unavailable') {
-                        showAlert("User Unavailable", "The user is not available for calls", "error");
-                    }
-                });
-
-                console.log('PeerJS initializing...');
-                
+                return stream;
             } catch (error) {
-                console.error('Failed to initialize PeerJS:', error);
-                showAlert("Connection Error", "Could not initialize call system", "error");
+                console.error('Error accessing media:', error);
+                showAlert("Media Error", "Please allow camera and microphone access", "error");
+                throw error;
             }
         }
 
-        // Modified initiateCall function using PeerJS
+        // Modified initiateCall function
         window.initiateCall = async function(targetUser) {
             if (callCooldown || isInCall) {
                 return;
@@ -1499,58 +1389,72 @@
                 return;
             }
             
-            if (!userData.peerId) {
-                showAlert("Cannot Call", "User's connection is not ready yet", "warning");
-                return;
-            }
-            
             try {
-                console.log(`📞 Calling ${targetUser} (Peer ID: ${userData.peerId})`);
+                console.log(`📞 Calling ${targetUser}...`);
+                currentCallTarget = targetUser;
                 
-                // Get media first
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        width: { ideal: 640 },
-                        height: { ideal: 480 }
-                    },
-                    audio: true
-                });
-                
+                // Get media stream
+                const stream = await getMediaStream();
                 localStream = stream;
                 localVideo.srcObject = stream;
                 localLabel.textContent = `${username} (You)`;
                 
-                // Initiate call through PeerJS
-                const call = myPeer.call(userData.peerId, stream);
+                // Create peer as initiator
+                peer = new SimplePeer({
+                    initiator: true,
+                    trickle: false,
+                    stream: stream,
+                    config: {
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' },
+                            { urls: 'stun:stun1.l.google.com:19302' }
+                        ]
+                    }
+                });
                 
-                if (!call) {
-                    throw new Error('Failed to create call');
-                }
+                // Set up peer event handlers
+                peer.on('signal', (data) => {
+                    console.log('📡 Sending signal data');
+                    // Send signal data to target user via Supabase
+                    if (callChannel) {
+                        callChannel.send({
+                            type: 'broadcast',
+                            event: 'call-signal',
+                            payload: {
+                                to: targetUser,
+                                from: username,
+                                signal: data,
+                                type: 'offer'
+                            }
+                        });
+                    }
+                });
                 
-                currentCall = call;
-                isInCall = true;
-                
-                // Show call UI immediately
-                videoContainer.style.display = 'flex';
-                remoteLabel.textContent = `Calling ${targetUser}...`;
-                
-                call.on('stream', (remoteStream) => {
-                    console.log('✅ Received remote stream from', targetUser);
+                peer.on('stream', (remoteStream) => {
+                    console.log('✅ Received remote stream');
                     remoteVideo.srcObject = remoteStream;
                     remoteLabel.textContent = targetUser;
+                    videoContainer.style.display = 'flex';
+                    isInCall = true;
+                    currentCall = peer;
+                    
                     showAlert("Call Connected", `Connected to ${targetUser}`, "success", 2000);
                 });
                 
-                call.on('close', () => {
+                peer.on('close', () => {
                     console.log('📞 Call closed');
                     endVideoCall();
                 });
                 
-                call.on('error', (err) => {
-                    console.error('Call error:', err);
-                    showAlert("Call Failed", "Could not establish connection", "error");
+                peer.on('error', (err) => {
+                    console.error('Peer error:', err);
+                    showAlert("Call Error", "Connection failed", "error");
                     endVideoCall();
                 });
+                
+                // Show call UI
+                videoContainer.style.display = 'flex';
+                remoteLabel.textContent = `Calling ${targetUser}...`;
                 
                 // Set cooldown
                 callCooldown = true;
@@ -1560,7 +1464,7 @@
                 
             } catch (error) {
                 console.error('Call failed:', error);
-                showAlert("Call Failed", error.message || "Could not start call", "error");
+                showAlert("Call Failed", "Could not start call", "error");
                 
                 if (localStream) {
                     localStream.getTracks().forEach(track => track.stop());
@@ -1568,17 +1472,203 @@
                 }
                 
                 callCooldown = false;
-                isInCall = false;
-                currentCall = null;
             }
         };
+
+        function setupCallChannel() {
+            callChannel = supabase.channel("webrtc-calls");
+            
+            callChannel.subscribe();
+            
+            // Handle incoming call signals
+            callChannel.on("broadcast", { event: "call-signal" }, async (payload) => {
+                const { to, from, signal, type } = payload.payload;
+                
+                if (to !== username) return;
+                
+                console.log(`📞 Received signal from ${from}, type: ${type}`);
+                
+                if (type === 'offer') {
+                    // Incoming call
+                    if (isInCall) {
+                        // Busy, send busy signal
+                        if (callChannel) {
+                            callChannel.send({
+                                type: 'broadcast',
+                                event: 'call-signal',
+                                payload: {
+                                    to: from,
+                                    from: username,
+                                    signal: null,
+                                    type: 'busy'
+                                }
+                            });
+                        }
+                        return;
+                    }
+                    
+                    currentCallTarget = from;
+                    
+                    try {
+                        // Get media stream
+                        const stream = await getMediaStream();
+                        localStream = stream;
+                        localVideo.srcObject = stream;
+                        localLabel.textContent = `${username} (You)`;
+                        
+                        // Create peer as answerer
+                        peer = new SimplePeer({
+                            initiator: false,
+                            trickle: false,
+                            stream: stream,
+                            config: {
+                                iceServers: [
+                                    { urls: 'stun:stun.l.google.com:19302' },
+                                    { urls: 'stun:stun1.l.google.com:19302' }
+                                ]
+                            }
+                        });
+                        
+                        // Set up peer event handlers
+                        peer.on('signal', (data) => {
+                            console.log('📡 Sending answer signal');
+                            // Send answer signal back
+                            if (callChannel) {
+                                callChannel.send({
+                                    type: 'broadcast',
+                                    event: 'call-signal',
+                                    payload: {
+                                        to: from,
+                                        from: username,
+                                        signal: data,
+                                        type: 'answer'
+                                    }
+                                });
+                            }
+                        });
+                        
+                        peer.on('stream', (remoteStream) => {
+                            console.log('✅ Received remote stream from', from);
+                            remoteVideo.srcObject = remoteStream;
+                            remoteLabel.textContent = from;
+                            videoContainer.style.display = 'flex';
+                            isInCall = true;
+                            currentCall = peer;
+                            
+                            showAlert("Call Connected", `Connected to ${from}`, "success", 2000);
+                        });
+                        
+                        peer.on('close', () => {
+                            console.log('📞 Call closed');
+                            endVideoCall();
+                        });
+                        
+                        peer.on('error', (err) => {
+                            console.error('Peer error:', err);
+                            endVideoCall();
+                        });
+                        
+                        // Show call UI
+                        videoContainer.style.display = 'flex';
+                        remoteLabel.textContent = from;
+                        
+                        // Handle the offer signal
+                        peer.signal(signal);
+                        
+                    } catch (error) {
+                        console.error('Error answering call:', error);
+                        showAlert("Call Failed", "Could not answer call", "error");
+                    }
+                }
+                else if (type === 'answer') {
+                    // Answer to our call
+                    if (peer && !isInCall && currentCallTarget === from) {
+                        console.log('✅ Received answer from', from);
+                        peer.signal(signal);
+                    }
+                }
+                else if (type === 'busy') {
+                    // Other user is busy
+                    if (currentCallTarget === from) {
+                        showAlert("User Busy", `${from} is busy on another call`, "warning");
+                        endVideoCall();
+                    }
+                }
+            });
+            
+            // Handle online status
+            callChannel.on("broadcast", { event: "online-status" }, (payload) => {
+                const { username: user, status, lastSeen, timestamp } = payload.payload;
+                
+                if (user !== username) {
+                    const now = Date.now();
+                    chatUsers.set(user, { 
+                        lastSeen, 
+                        online: status === 'online',
+                        lastUpdated: timestamp || now
+                    });
+                    updateUserList();
+                }
+            });
+            
+            // Handle private messages
+            callChannel.on("broadcast", { event: "private-message" }, (payload) => {
+                const { from, to, message, timestamp, messageId } = payload.payload;
+                
+                if (to !== username) return;
+                
+                const chatKey = [from, to].sort().join('_');
+                if (privateChatHistory[chatKey]) {
+                    const isDuplicate = privateChatHistory[chatKey].some(msg => 
+                        msg.message === message && 
+                        msg.from === from && 
+                        Math.abs(new Date(msg.timestamp) - new Date(timestamp)) < 1000
+                    );
+                    if (isDuplicate) return;
+                }
+                
+                if (from === currentPrivateChatWith) {
+                    addPrivateMessageToChat(from, message, timestamp, false);
+                }
+                
+                if (!privateChatHistory[chatKey]) {
+                    privateChatHistory[chatKey] = [];
+                }
+                privateChatHistory[chatKey].push({
+                    from,
+                    message,
+                    timestamp,
+                    isSent: false,
+                    messageId: messageId || Date.now()
+                });
+                
+                savePrivateMessages();
+                
+                if (from !== username && currentPrivateChatWith !== from) {
+                    showAlert("Private Message", `${from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`, "info");
+                }
+            });
+            
+            // Handle typing indicator
+            callChannel.on("broadcast", { event: "user-typing" }, (payload) => {
+                const { username: user, isTyping } = payload.payload;
+                
+                if (user !== username) {
+                    if (isTyping) {
+                        typingIndicator.textContent = `${user} is typing...`;
+                    } else {
+                        typingIndicator.textContent = '';
+                    }
+                }
+            });
+        }
 
         function endVideoCall() {
             console.log('📞 Ending call');
             
-            if (currentCall) {
-                currentCall.close();
-                currentCall = null;
+            if (peer) {
+                peer.destroy();
+                peer = null;
             }
             
             if (localStream) {
@@ -1594,12 +1684,21 @@
             
             videoContainer.style.display = 'none';
             isInCall = false;
+            currentCall = null;
+            currentCallTarget = null;
             isMuted = false;
-            isSharing = false;
+            
+            // Reset focus
+            localVideoWrapper.classList.remove('focused', 'minimized');
+            remoteVideoWrapper.classList.remove('focused', 'minimized');
+            focusedVideo = null;
             
             // Reset mute button
             callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
             callMuteBtn.style.background = '#f39c12';
+            
+            // Reset labels
+            remoteLabel.textContent = 'Waiting...';
             
             // Set cooldown
             callCooldown = true;
@@ -1643,49 +1742,8 @@
         }
 
         function toggleShareScreen() {
-            if (!isSharing) {
-                navigator.mediaDevices.getDisplayMedia({ video: true })
-                    .then(stream => {
-                        isSharing = true;
-                        screenStream = stream;
-                        callShareBtn.innerHTML = '<i class="fas fa-stop"></i> Stop Share';
-                        callShareBtn.style.background = '#e74c3c';
-                        
-                        // Replace video track in current call
-                        if (currentCall && currentCall.peerConnection) {
-                            const videoSender = currentCall.peerConnection.getSenders()
-                                .find(sender => sender.track && sender.track.kind === 'video');
-                            if (videoSender) {
-                                videoSender.replaceTrack(stream.getVideoTracks()[0]);
-                            }
-                        }
-                        
-                        stream.getVideoTracks()[0].onended = () => {
-                            toggleShareScreen();
-                        };
-                        
-                    }).catch(err => {
-                        console.error('Error sharing screen:', err);
-                    });
-            } else {
-                isSharing = false;
-                callShareBtn.innerHTML = '<i class="fas fa-share-square"></i> Share';
-                callShareBtn.style.background = '#2ecc71';
-                
-                if (screenStream) {
-                    screenStream.getTracks().forEach(track => track.stop());
-                    screenStream = null;
-                }
-                
-                // Restore camera track
-                if (currentCall && localStream) {
-                    const videoSender = currentCall.peerConnection.getSenders()
-                        .find(sender => sender.track && sender.track.kind === 'video');
-                    if (videoSender && localStream.getVideoTracks()[0]) {
-                        videoSender.replaceTrack(localStream.getVideoTracks()[0]);
-                    }
-                }
-            }
+            // Screen sharing placeholder
+            showAlert("Coming Soon", "Screen sharing will be available soon", "info");
         }
 
         // ==================== SUPPORTING FUNCTIONS ====================
@@ -1755,8 +1813,7 @@
             chatUsers.set(username, { 
                 lastSeen: timestamp, 
                 online: true,
-                lastUpdated: now,
-                peerId: myPeerId
+                lastUpdated: now
             });
             
             if (callChannel) {
@@ -1767,8 +1824,7 @@
                         username, 
                         status: 'online',
                         lastSeen: timestamp,
-                        timestamp: now,
-                        peerId: myPeerId
+                        timestamp: now
                     }
                 });
             }
@@ -1890,93 +1946,6 @@
             }
         }
 
-        function setupCallChannel() {
-            callChannel = supabase.channel("webrtc-calls");
-            
-            callChannel.subscribe();
-            
-            // Handle peer ID sharing
-            callChannel.on("broadcast", { event: "peer-id" }, (payload) => {
-                const { username: user, peerId } = payload.payload;
-                
-                if (user !== username) {
-                    if (chatUsers.has(user)) {
-                        const userData = chatUsers.get(user);
-                        userData.peerId = peerId;
-                        chatUsers.set(user, userData);
-                        updateUserList();
-                    }
-                }
-            });
-            
-            // Handle online status
-            callChannel.on("broadcast", { event: "online-status" }, (payload) => {
-                const { username: user, status, lastSeen, timestamp, peerId } = payload.payload;
-                
-                if (user !== username) {
-                    const now = Date.now();
-                    chatUsers.set(user, { 
-                        lastSeen, 
-                        online: status === 'online',
-                        lastUpdated: timestamp || now,
-                        peerId: peerId
-                    });
-                    updateUserList();
-                }
-            });
-            
-            // Handle private messages
-            callChannel.on("broadcast", { event: "private-message" }, (payload) => {
-                const { from, to, message, timestamp, messageId } = payload.payload;
-                
-                if (to !== username) return;
-                
-                const chatKey = [from, to].sort().join('_');
-                if (privateChatHistory[chatKey]) {
-                    const isDuplicate = privateChatHistory[chatKey].some(msg => 
-                        msg.message === message && 
-                        msg.from === from && 
-                        Math.abs(new Date(msg.timestamp) - new Date(timestamp)) < 1000
-                    );
-                    if (isDuplicate) return;
-                }
-                
-                if (from === currentPrivateChatWith) {
-                    addPrivateMessageToChat(from, message, timestamp, false);
-                }
-                
-                if (!privateChatHistory[chatKey]) {
-                    privateChatHistory[chatKey] = [];
-                }
-                privateChatHistory[chatKey].push({
-                    from,
-                    message,
-                    timestamp,
-                    isSent: false,
-                    messageId: messageId || Date.now()
-                });
-                
-                savePrivateMessages();
-                
-                if (from !== username && currentPrivateChatWith !== from) {
-                    showAlert("Private Message", `${from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`, "info");
-                }
-            });
-            
-            // Handle typing indicator
-            callChannel.on("broadcast", { event: "user-typing" }, (payload) => {
-                const { username: user, isTyping } = payload.payload;
-                
-                if (user !== username) {
-                    if (isTyping) {
-                        typingIndicator.textContent = `${user} is typing...`;
-                    } else {
-                        typingIndicator.textContent = '';
-                    }
-                }
-            });
-        }
-
         async function performLogin(name) {
             const isAvailable = await isUsernameAvailable(name);
             
@@ -2011,7 +1980,8 @@
             loadPrivateMessages();
             setupEventListeners();
             setupCallChannel();
-            initializePeerJS();
+            setupVideoFocus(); // Setup video focus functionality
+            initializeCallSystem();
             
             onlineCheckInterval = setInterval(() => {
                 updateOnlineStatus();
@@ -2322,10 +2292,6 @@
 
         function cleanupAllResources() {
             endVideoCall();
-            
-            if (myPeer) {
-                myPeer.destroy();
-            }
             
             if (onlineCheckInterval) {
                 clearInterval(onlineCheckInterval);
