@@ -755,6 +755,7 @@
             width: 100%;
             height: 100%;
             object-fit: cover;
+            transform: rotateY(180deg); /* Mirror effect for self-view */
         }
 
         .video-label {
@@ -1028,6 +1029,13 @@
         .nature-site::-webkit-scrollbar-thumb {
             background: var(--primary);
             border-radius: 3px;
+        }
+
+        /* Cooldown timer */
+        .cooldown-timer {
+            font-size: 0.7rem;
+            opacity: 0.8;
+            margin-left: 5px;
         }
     </style>
 </head>
@@ -1364,9 +1372,6 @@
         let isPasswordUnlocked = localStorage.getItem('passwordUnlocked') === 'true';
         let currentPrivateChatWith = null;
         let privateChatHistory = {};
-        let canSendMessage = true;
-        let messageCooldown = false;
-        let privateMessageCooldown = false;
 
         // WebRTC Call State
         let currentCall = null;
@@ -1379,10 +1384,15 @@
         let isSharing = false;
         let screenStream = null;
         let callTimeout = null;
-        let callCooldown = false;
         let pendingCallOffer = null;
         let pendingCaller = null;
-        let lastCallEndTime = 0;
+        
+        // Cooldown states
+        let messageCooldown = false;
+        let privateMessageCooldown = false;
+        let callCooldown = false;
+        let messageCooldownTimer = null;
+        let privateMessageCooldownTimer = null;
 
         // Generate unique device ID
         function generateDeviceId() {
@@ -1644,14 +1654,22 @@
             showAlert("Welcome!", `${randomGreeting} You're now chatting as ${username}`, "success");
         }
 
-        // ==================== FIXED CALL LOGIC ====================
+        // ==================== FIXED WEBRTC CALL LOGIC ====================
         
         /* ------------------ MEDIA ------------------ */
         async function getMedia() {
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({
-                    video: true,
-                    audio: true
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: "user"
+                    },
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
                 });
                 localVideo.srcObject = localStream;
                 localLabel.textContent = `${username} (You)`;
@@ -1666,32 +1684,46 @@
 
         /* ------------------ PEER CONNECTION ------------------ */
         function createPeer(remoteUser) {
-            peerConnection = new RTCPeerConnection({
-                iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-            });
+            const configuration = {
+                iceServers: [
+                    { urls: "stun:stun.l.google.com:19302" },
+                    { urls: "stun:stun1.l.google.com:19302" },
+                    { urls: "stun:stun2.l.google.com:19302" }
+                ]
+            };
+            
+            peerConnection = new RTCPeerConnection(configuration);
 
             // Add local tracks
             if (localStream) {
                 localStream.getTracks().forEach(track => {
                     peerConnection.addTrack(track, localStream);
+                    console.log(`Added ${track.kind} track to peer connection`);
                 });
             }
 
-            // Handle incoming remote stream
-            peerConnection.ontrack = e => {
-                console.log('📡 Received remote track');
-                remoteVideo.srcObject = e.streams[0];
-                remoteLabel.textContent = remoteUser;
+            // Handle incoming remote stream - FIXED
+            peerConnection.ontrack = (event) => {
+                console.log('📡 Received remote track:', event.track.kind);
+                if (event.streams && event.streams[0]) {
+                    remoteVideo.srcObject = event.streams[0];
+                    remoteLabel.textContent = remoteUser;
+                    console.log('✅ Remote video stream set');
+                }
             };
 
             // Handle ICE candidates
-            peerConnection.onicecandidate = e => {
-                if (e.candidate && callChannel && currentCall) {
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate && callChannel && currentCall) {
                     console.log('🧊 Sending ICE candidate');
                     callChannel.send({
                         type: "broadcast",
-                        event: "ice",
-                        payload: { to: currentCall, from: username, candidate: e.candidate }
+                        event: "ice-candidate",
+                        payload: { 
+                            to: currentCall, 
+                            from: username, 
+                            candidate: event.candidate 
+                        }
                     });
                 }
             };
@@ -1707,6 +1739,11 @@
                     console.log('❌ Call disconnected');
                     endVideoCall();
                 }
+            };
+
+            // Handle ICE connection state
+            peerConnection.oniceconnectionstatechange = () => {
+                console.log('🧊 ICE connection state:', peerConnection.iceConnectionState);
             };
         }
 
@@ -1725,12 +1762,13 @@
             if (callTimeout) clearTimeout(callTimeout);
         }
 
-        /* ------------------ SETUP CALL CHANNEL (FIXED) ------------------ */
+        /* ------------------ SETUP CALL CHANNEL ------------------ */
         function setupCallChannel() {
             callChannel = supabase.channel("webrtc-calls");
             
             callChannel.subscribe();
             
+            // Handle incoming call offers
             callChannel.on("broadcast", { event: "offer" }, async ({ payload }) => {
                 if (payload.to !== username) return;
                 
@@ -1748,17 +1786,20 @@
                 callTimeout = setTimeout(() => {
                     if (callPopup.style.display === 'flex') {
                         declineCall();
+                        showAlert("Call Missed", `Missed call from ${payload.from}`, "warning");
                     }
                 }, 30000);
             });
 
+            // Handle call answers
             callChannel.on("broadcast", { event: "answer" }, async ({ payload }) => {
                 if (payload.to !== username || currentCall !== payload.from) return;
                 
                 console.log('✅ Call answered by:', payload.from);
                 try {
                     if (peerConnection && peerConnection.signalingState === "have-local-offer") {
-                        await peerConnection.setRemoteDescription(payload.answer);
+                        const remoteDesc = new RTCSessionDescription(payload.answer);
+                        await peerConnection.setRemoteDescription(remoteDesc);
                         remoteLabel.textContent = payload.from;
                         showAlert("Call Connected", `${payload.from} accepted your call!`, "success");
                         
@@ -1770,45 +1811,35 @@
                 }
             });
 
-            callChannel.on("broadcast", { event: "ice" }, async ({ payload }) => {
+            // Handle ICE candidates - FIXED
+            callChannel.on("broadcast", { event: "ice-candidate" }, async ({ payload }) => {
                 if (payload.to !== username || currentCall !== payload.from) return;
                 
                 try {
                     if (peerConnection && peerConnection.remoteDescription) {
-                        await peerConnection.addIceCandidate(payload.candidate);
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+                        console.log('✅ Added ICE candidate from', payload.from);
                     }
                 } catch (error) {
                     console.error("Error adding ICE candidate:", error);
                 }
             });
 
+            // Handle call declined
             callChannel.on("broadcast", { event: "call-declined" }, ({ payload }) => {
                 if (payload.to === username && currentCall === payload.from) {
                     console.log('❌ Call declined by remote');
                     showAlert("Call Declined", `${payload.from} declined the call`, "error");
                     endVideoCall();
-                    currentCall = null;
-                    callPopup.style.display = 'none';
                 }
             });
 
+            // Handle call ended
             callChannel.on("broadcast", { event: "call-ended" }, ({ payload }) => {
-                if ((payload.from === currentCall) || (payload.to === username && payload.from === currentCall)) {
+                if (payload.to === username && currentCall === payload.from) {
                     console.log('📞 Call ended by remote');
-                    showAlert("Call Ended", `${currentCall} ended the call`, "info");
+                    showAlert("Call Ended", `${payload.from} ended the call`, "info");
                     endVideoCall();
-                    currentCall = null;
-                }
-            });
-
-            callChannel.on("broadcast", { event: "call-canceled" }, ({ payload }) => {
-                if (payload.to === username && pendingCaller === payload.from) {
-                    console.log('📞 Call canceled by caller');
-                    showAlert("Call Canceled", `${payload.from} canceled the call`, "info");
-                    callPopup.style.display = 'none';
-                    pendingCaller = null;
-                    pendingCallOffer = null;
-                    if (callTimeout) clearTimeout(callTimeout);
                 }
             });
             
@@ -1884,11 +1915,10 @@
             });
         }
 
-        /* ------------------ START CALL (FIXED) ------------------ */
+        /* ------------------ START CALL ------------------ */
         window.initiateCall = async function (targetUser) {
-            const now = Date.now();
             if (callCooldown) {
-                showAlert("Slow Down", "Please wait a moment before starting another call", "warning");
+                // Don't show alert, just silently ignore
                 return;
             }
             
@@ -1929,25 +1959,29 @@
                 createPeer(targetUser);
                 
                 // Create offer
-                const offer = await peerConnection.createOffer({
+                const offerOptions = {
                     offerToReceiveAudio: true,
                     offerToReceiveVideo: true
-                });
+                };
+                
+                const offer = await peerConnection.createOffer(offerOptions);
                 await peerConnection.setLocalDescription(offer);
                 
                 // Send call request
                 callChannel.send({
                     type: "broadcast",
                     event: "offer",
-                    payload: { to: targetUser, from: username, offer }
+                    payload: { 
+                        to: targetUser, 
+                        from: username, 
+                        offer: offer 
+                    }
                 });
                 
                 // Show call UI
                 videoContainer.style.display = 'flex';
                 isInCall = true;
                 remoteLabel.textContent = `Calling ${targetUser}...`;
-                
-                showAlert("Calling...", `Initiating video call with ${targetUser}`, "info");
                 
                 // Set cooldown
                 callCooldown = true;
@@ -2002,7 +2036,8 @@
                     
                     // Set remote description from stored offer
                     if (pendingCallOffer) {
-                        await peerConnection.setRemoteDescription(pendingCallOffer);
+                        const remoteDesc = new RTCSessionDescription(pendingCallOffer);
+                        await peerConnection.setRemoteDescription(remoteDesc);
                         
                         // Create and send answer
                         const answer = await peerConnection.createAnswer();
@@ -2011,7 +2046,11 @@
                         callChannel.send({
                             type: "broadcast",
                             event: "answer",
-                            payload: { to: currentCall, from: username, answer }
+                            payload: { 
+                                to: currentCall, 
+                                from: username, 
+                                answer: answer 
+                            }
                         });
                         
                         // Show call UI
@@ -2046,11 +2085,9 @@
                 if (isMuted) {
                     callMuteBtn.innerHTML = '<i class="fas fa-microphone-slash"></i> Unmute';
                     callMuteBtn.style.background = '#e74c3c';
-                    showAlert("Muted", "Microphone is muted", "warning", 2000);
                 } else {
                     callMuteBtn.innerHTML = '<i class="fas fa-microphone"></i> Mute';
                     callMuteBtn.style.background = '#f39c12';
-                    showAlert("Unmuted", "Microphone is active", "success", 2000);
                 }
             }
         }
@@ -2071,7 +2108,6 @@
                         }
                         
                         track.onended = () => toggleShareScreen();
-                        showAlert("Screen Sharing", "You are sharing your screen", "success", 2000);
                     })
                     .catch(err => {
                         console.error('Error sharing screen:', err);
@@ -2094,8 +2130,6 @@
                         sender.replaceTrack(camTrack);
                     }
                 }
-                
-                showAlert("Screen Sharing Stopped", "You stopped sharing", "info", 2000);
             }
         }
 
@@ -2167,29 +2201,25 @@
             setTimeout(() => {
                 callCooldown = false;
             }, 3000);
-            
-            showAlert("Call Ended", "Call has been terminated", "info");
         }
 
-        // ==================== MESSAGE COOLDOWN SYSTEM ====================
+        // ==================== COOLDOWN SYSTEM ====================
         
         /* ------------------ SEND MESSAGE WITH COOLDOWN ------------------ */
         async function sendMessage() {
             if (messageCooldown) {
-                showAlert("Slow Down", "Please wait a moment before sending another message", "warning");
+                // Silently ignore instead of showing alert
                 return;
             }
             
             const text = messageInput.value.trim();
             if (!text) {
-                showAlert("Empty message", "Type something to send!", "warning");
                 return;
             }
             
             // Set cooldown
             messageCooldown = true;
-            sendBtn.disabled = true;
-            sendBtn.innerHTML = '<i class="fas fa-clock"></i> Wait...';
+            startCooldownTimer(sendBtn, 1);
             
             const msg = { username, message: text };
             renderMessage(msg);
@@ -2200,7 +2230,6 @@
                 await supabase.from('themessages').insert([msg]);
             } catch (error) {
                 console.error("Error sending message:", error);
-                showAlert("Error", "Failed to send message", "error");
             }
             
             // Clear cooldown after 1 second
@@ -2214,7 +2243,7 @@
         /* ------------------ SEND PRIVATE MESSAGE WITH COOLDOWN ------------------ */
         async function sendPrivateMessage() {
             if (privateMessageCooldown) {
-                showAlert("Slow Down", "Please wait a moment before sending another message", "warning");
+                // Silently ignore instead of showing alert
                 return;
             }
             
@@ -2225,8 +2254,7 @@
             
             // Set cooldown
             privateMessageCooldown = true;
-            sendPrivateBtn.disabled = true;
-            sendPrivateBtn.innerHTML = '<i class="fas fa-clock"></i> Wait...';
+            startCooldownTimer(sendPrivateBtn, 1);
             
             const timestamp = new Date().toISOString();
             const messageId = Date.now();
@@ -2273,6 +2301,34 @@
                 sendPrivateBtn.disabled = false;
                 sendPrivateBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send';
             }, 1000);
+        }
+
+        /* ------------------ COOLDOWN TIMER ------------------ */
+        function startCooldownTimer(button, seconds) {
+            button.disabled = true;
+            let timeLeft = seconds;
+            
+            const updateButtonText = () => {
+                button.innerHTML = `<i class="fas fa-clock"></i> ${timeLeft}s`;
+                timeLeft--;
+                
+                if (timeLeft < 0) {
+                    clearInterval(timer);
+                    button.disabled = false;
+                    button.innerHTML = '<i class="fas fa-paper-plane"></i> Send';
+                }
+            };
+            
+            updateButtonText();
+            const timer = setInterval(updateButtonText, 1000);
+            
+            if (button === sendBtn) {
+                if (messageCooldownTimer) clearInterval(messageCooldownTimer);
+                messageCooldownTimer = timer;
+            } else if (button === sendPrivateBtn) {
+                if (privateMessageCooldownTimer) clearInterval(privateMessageCooldownTimer);
+                privateMessageCooldownTimer = timer;
+            }
         }
 
         // ==================== KEYBOARD SHORTCUTS ====================
